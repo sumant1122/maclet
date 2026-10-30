@@ -16,6 +16,7 @@ pub struct ContainerConfig {
     pub command: String,
     pub args: Vec<String>,
     pub env: HashMap<String, String>,
+    pub cgroup_path: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone)]
@@ -111,7 +112,16 @@ fn run_linux_namespaces(config: &ContainerConfig) -> Result<ExecutionResult> {
         }
 
         if container_pid == 0 {
-            // --- Container Init Process (PID 1) ---
+            // Attach to cgroup v2 if specified
+            if let Some(ref cg) = config.cgroup_path {
+                let procs_file = cg.join("cgroup.procs");
+                let _ = fs::write(procs_file, "0\n");
+                // Unshare cgroup namespace so the container's cgroup becomes the virtualized root
+                unsafe {
+                    let _ = libc::unshare(libc::CLONE_NEWCGROUP);
+                }
+            }
+
             // Redirect stdout and stderr to pipes
             unsafe {
                 libc::dup2(stdout_pipe[1], libc::STDOUT_FILENO);
@@ -320,6 +330,20 @@ fn setup_container_root(config: &ContainerConfig) -> Result<()> {
         );
     }
 
+    // 10b. Mount cgroup2 on /sys/fs/cgroup
+    let _ = fs::create_dir_all("/sys/fs/cgroup");
+    let cgroup_c = CString::new("/sys/fs/cgroup").unwrap();
+    let cgroup_type = CString::new("cgroup2").unwrap();
+    unsafe {
+        let _ = libc::mount(
+            cgroup_type.as_ptr(),
+            cgroup_c.as_ptr(),
+            cgroup_type.as_ptr(),
+            libc::MS_NOSUID | libc::MS_NODEV | libc::MS_NOEXEC,
+            std::ptr::null(),
+        );
+    }
+
     // 11. Mount /dev
     fs::create_dir_all("/dev")?;
     let dev_c = CString::new("/dev").unwrap();
@@ -418,6 +442,7 @@ mod tests {
             command: "/bin/sh".to_string(),
             args: vec!["-c".to_string(), "echo hi".to_string()],
             env: HashMap::new(),
+            cgroup_path: Some(PathBuf::from("/sys/fs/cgroup/maclet/test-1")),
         };
         assert_eq!(cfg.id, "test-1");
         assert_eq!(cfg.hostname, "maclet-test");

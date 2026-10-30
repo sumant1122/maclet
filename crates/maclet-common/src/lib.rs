@@ -24,6 +24,81 @@ impl Default for VmConfig {
     }
 }
 
+/// Resource limits enforced via cgroups v2
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct ResourceLimits {
+    pub memory_bytes: Option<u64>,
+    pub cpu_quota_usec: Option<u64>,
+    pub cpu_period_usec: Option<u64>,
+    pub pids_max: Option<u64>,
+}
+
+impl ResourceLimits {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn with_memory(mut self, bytes: u64) -> Self {
+        self.memory_bytes = Some(bytes);
+        self
+    }
+
+    pub fn with_cpus(mut self, cpus: f64) -> Self {
+        let period = 100_000u64; // standard 100ms
+        let quota = (cpus * period as f64).round() as u64;
+        self.cpu_period_usec = Some(period);
+        self.cpu_quota_usec = Some(quota);
+        self
+    }
+
+    pub fn with_pids(mut self, pids: u64) -> Self {
+        self.pids_max = Some(pids);
+        self
+    }
+}
+
+/// Resource accounting and live statistics read from cgroups v2
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct CgroupMetrics {
+    pub memory_current: u64,
+    pub memory_max: Option<u64>,
+    pub cpu_usage_usec: u64,
+    pub cpu_user_usec: u64,
+    pub cpu_system_usec: u64,
+    pub pids_current: u64,
+    pub pids_max: Option<u64>,
+}
+
+/// Helper to parse human-readable memory strings (e.g. "512m", "1g", "64k")
+pub fn parse_memory_bytes(input: &str) -> Result<u64> {
+    let s = input.trim().to_lowercase();
+    if s.is_empty() {
+        return Err(MacletError::Protocol("Empty memory string".to_string()));
+    }
+
+    let (num_str, multiplier) = if s.ends_with("kb") || s.ends_with('k') {
+        let n = s.trim_end_matches("kb").trim_end_matches('k');
+        (n, 1024u64)
+    } else if s.ends_with("mb") || s.ends_with('m') {
+        let n = s.trim_end_matches("mb").trim_end_matches('m');
+        (n, 1024u64 * 1024)
+    } else if s.ends_with("gb") || s.ends_with('g') {
+        let n = s.trim_end_matches("gb").trim_end_matches('g');
+        (n, 1024u64 * 1024 * 1024)
+    } else if s.ends_with('b') {
+        let n = s.trim_end_matches('b');
+        (n, 1u64)
+    } else {
+        (s.as_str(), 1u64)
+    };
+
+    let val = num_str.parse::<u64>().map_err(|e| {
+        MacletError::Protocol(format!("Invalid memory number '{num_str}': {e}"))
+    })?;
+
+    Ok(val * multiplier)
+}
+
 /// Commands and requests sent from macOS Host to Linux Guest Agent
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type")]
@@ -55,9 +130,14 @@ pub enum HostMessage {
         env: HashMap<String, String>,
         #[serde(default)]
         hostname: Option<String>,
+        #[serde(default)]
+        limits: Option<ResourceLimits>,
         #[serde(default = "default_timeout")]
         timeout_secs: u64,
     },
+
+    #[serde(rename = "inspect_container")]
+    InspectContainer { id: String },
 
     #[serde(rename = "shutdown")]
     Shutdown { id: String },
@@ -95,6 +175,15 @@ pub enum GuestMessage {
         exit_code: i32,
         stdout: String,
         stderr: String,
+        #[serde(default)]
+        metrics: Option<CgroupMetrics>,
+    },
+
+    #[serde(rename = "inspect_result")]
+    InspectResult {
+        id: String,
+        state: String,
+        metrics: CgroupMetrics,
     },
 
     #[serde(rename = "error")]
@@ -165,6 +254,26 @@ mod tests {
     }
 
     #[test]
+    fn test_memory_parsing() {
+        assert_eq!(parse_memory_bytes("512m").unwrap(), 512 * 1024 * 1024);
+        assert_eq!(parse_memory_bytes("1g").unwrap(), 1024 * 1024 * 1024);
+        assert_eq!(parse_memory_bytes("64k").unwrap(), 64 * 1024);
+        assert_eq!(parse_memory_bytes("1024").unwrap(), 1024);
+    }
+
+    #[test]
+    fn test_resource_limits_builder() {
+        let limits = ResourceLimits::new()
+            .with_memory(parse_memory_bytes("256m").unwrap())
+            .with_cpus(1.5)
+            .with_pids(100);
+        assert_eq!(limits.memory_bytes, Some(256 * 1024 * 1024));
+        assert_eq!(limits.cpu_quota_usec, Some(150_000));
+        assert_eq!(limits.cpu_period_usec, Some(100_000));
+        assert_eq!(limits.pids_max, Some(100));
+    }
+
+    #[test]
     fn test_container_message_serialization() {
         let host_msg = HostMessage::RunContainer {
             id: "cnt-1".to_string(),
@@ -173,6 +282,7 @@ mod tests {
             args: vec!["-c".to_string(), "echo hi".to_string()],
             env: HashMap::new(),
             hostname: Some("mybox".to_string()),
+            limits: Some(ResourceLimits::new().with_pids(50)),
             timeout_secs: 30,
         };
         let s = serde_json::to_string(&host_msg).unwrap();
@@ -185,6 +295,15 @@ mod tests {
             exit_code: 0,
             stdout: "hi\n".to_string(),
             stderr: String::new(),
+            metrics: Some(CgroupMetrics {
+                memory_current: 1024,
+                memory_max: Some(512 * 1024 * 1024),
+                cpu_usage_usec: 500,
+                cpu_user_usec: 300,
+                cpu_system_usec: 200,
+                pids_current: 1,
+                pids_max: Some(50),
+            }),
         };
         let s2 = serde_json::to_string(&guest_msg).unwrap();
         assert!(s2.contains("\"type\":\"container_result\""));

@@ -252,6 +252,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "maclet-cgroups"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "maclet-common",
+ "thiserror",
+]
+
+[[package]]
 name = "maclet-cli"
 version = "0.1.0"
 dependencies = [
@@ -281,6 +290,7 @@ name = "maclet-container"
 version = "0.1.0"
 dependencies = [
  "libc",
+ "maclet-cgroups",
  "maclet-common",
  "maclet-namespaces",
  "thiserror",
@@ -292,6 +302,7 @@ version = "0.1.0"
 dependencies = [
  "flate2",
  "libc",
+ "maclet-cgroups",
  "maclet-common",
  "maclet-container",
  "maclet-ipc",

@@ -1,4 +1,5 @@
-use maclet_common::Result;
+use maclet_cgroups::CgroupV2Manager;
+use maclet_common::{CgroupMetrics, ResourceLimits, Result};
 use maclet_namespaces::{run_in_isolated_namespaces, ContainerConfig, ExecutionResult};
 use std::collections::HashMap;
 use std::fs;
@@ -11,6 +12,9 @@ pub struct Container {
     pub command: String,
     pub args: Vec<String>,
     pub env: HashMap<String, String>,
+    pub limits: Option<ResourceLimits>,
+    pub cgroup_path: Option<PathBuf>,
+    cgroup_mgr: CgroupV2Manager,
 }
 
 impl Container {
@@ -21,6 +25,7 @@ impl Container {
         args: Vec<String>,
         env: HashMap<String, String>,
         custom_hostname: Option<String>,
+        limits: Option<ResourceLimits>,
     ) -> Result<Self> {
         let hostname = custom_hostname.unwrap_or_else(|| {
             let short = if id.len() > 12 { &id[..12] } else { &id };
@@ -32,11 +37,8 @@ impl Container {
         let rootfs = container_root.join("rootfs");
         fs::create_dir_all(&rootfs)?;
 
-        // Prepare rootfs: if base_rootfs exists, populate or bind
-        // In Phase 2, we copy or bind mount the base rootfs
         #[cfg(target_os = "linux")]
         if base_rootfs.exists() {
-            // Bind mount base_rootfs into container rootfs
             unsafe {
                 use std::ffi::CString;
                 let src_c = CString::new(base_rootfs.to_str().unwrap()).unwrap();
@@ -52,6 +54,11 @@ impl Container {
             }
         }
 
+        // Initialize cgroups v2
+        let cgroup_mgr = CgroupV2Manager::new();
+        let _ = cgroup_mgr.init();
+        let cgroup_path = cgroup_mgr.create_container_cgroup(&id, &limits).ok();
+
         Ok(Self {
             id,
             hostname,
@@ -59,10 +66,13 @@ impl Container {
             command,
             args,
             env,
+            limits,
+            cgroup_path,
+            cgroup_mgr,
         })
     }
 
-    pub fn run(&self) -> Result<ExecutionResult> {
+    pub fn run(&self) -> Result<(ExecutionResult, Option<CgroupMetrics>)> {
         let config = ContainerConfig {
             id: self.id.clone(),
             hostname: self.hostname.clone(),
@@ -70,9 +80,13 @@ impl Container {
             command: self.command.clone(),
             args: self.args.clone(),
             env: self.env.clone(),
+            cgroup_path: self.cgroup_path.clone(),
         };
 
-        run_in_isolated_namespaces(&config)
+        let exec_result = run_in_isolated_namespaces(&config)?;
+        let metrics = self.cgroup_mgr.read_metrics(&self.id).ok();
+
+        Ok((exec_result, metrics))
     }
 
     pub fn cleanup(&self) {
@@ -83,6 +97,7 @@ impl Container {
                 libc::umount2(dst_c.as_ptr(), libc::MNT_DETACH);
             }
         }
+        self.cgroup_mgr.destroy_container_cgroup(&self.id);
         let container_root = PathBuf::from("/var/lib/maclet/containers").join(&self.id);
         let _ = fs::remove_dir_all(&container_root);
     }
@@ -101,6 +116,9 @@ mod tests {
             command: "/bin/sh".to_string(),
             args: vec![],
             env: HashMap::new(),
+            limits: None,
+            cgroup_path: None,
+            cgroup_mgr: CgroupV2Manager::new(),
         };
         assert_eq!(cnt.id, "c1");
     }

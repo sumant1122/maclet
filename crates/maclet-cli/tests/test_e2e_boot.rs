@@ -82,6 +82,7 @@ async fn test_vm_boot_and_handshake_and_exec() {
             ],
             env: HashMap::new(),
             hostname: Some("test-e2e-box".to_string()),
+            limits: None,
             timeout_secs: 20,
         },
     )
@@ -89,14 +90,53 @@ async fn test_vm_boot_and_handshake_and_exec() {
     .unwrap();
 
     let cnt_res: Option<GuestMessage> = read_async(&mut guest_buf_reader).await.unwrap();
-    if let Some(GuestMessage::ContainerResult { id, exit_code, stdout, stderr }) = cnt_res {
+    if let Some(GuestMessage::ContainerResult { id, exit_code, stdout, stderr, metrics }) = cnt_res {
         assert_eq!(id, "e2e-cnt");
         assert_eq!(exit_code, 0, "Container failed with stderr: {}", stderr);
         assert!(stdout.contains("PID: 1"), "PID was not 1: {}", stdout);
         assert!(stdout.contains("test-e2e-box"), "Hostname mismatch: {}", stdout);
         assert!(stdout.contains("Alpine Linux"), "Missing OS release: {}", stdout);
+        assert!(metrics.is_some());
     } else {
         panic!("Expected ContainerResult, got {:?}", cnt_res);
+    }
+
+    // Phase 3: Run container with cgroups v2 resource limits
+    let mem_limit = 256 * 1024 * 1024;
+    write_async(
+        &mut guest_writer,
+        &HostMessage::RunContainer {
+            id: "e2e-cgroup".to_string(),
+            image: "alpine".to_string(),
+            command: "/bin/sh".to_string(),
+            args: vec![
+                "-c".to_string(),
+                "cat /sys/fs/cgroup/memory.max; cat /sys/fs/cgroup/pids.max".to_string(),
+            ],
+            env: HashMap::new(),
+            hostname: Some("cgroup-test".to_string()),
+            limits: Some(
+                maclet_common::ResourceLimits::new()
+                    .with_memory(mem_limit)
+                    .with_cpus(1.0)
+                    .with_pids(50),
+            ),
+            timeout_secs: 20,
+        },
+    )
+    .await
+    .unwrap();
+
+    let cg_res: Option<GuestMessage> = read_async(&mut guest_buf_reader).await.unwrap();
+    if let Some(GuestMessage::ContainerResult { id, exit_code, stdout: _, stderr, metrics }) = cg_res {
+        assert_eq!(id, "e2e-cgroup");
+        assert_eq!(exit_code, 0, "Cgroup container failed: {}", stderr);
+        let m = metrics.expect("Expected metrics");
+        assert_eq!(m.memory_max, Some(mem_limit));
+        assert_eq!(m.pids_max, Some(50));
+        assert!(m.cpu_usage_usec > 0);
+    } else {
+        panic!("Expected ContainerResult, got {:?}", cg_res);
     }
 
     // Graceful stop

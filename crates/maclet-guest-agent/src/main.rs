@@ -1,5 +1,5 @@
 use flate2::read::GzDecoder;
-use maclet_common::{GuestMessage, HostMessage, Result};
+use maclet_common::{GuestMessage, HostMessage, ResourceLimits, Result};
 use maclet_container::Container;
 use maclet_ipc::{read_sync, write_sync};
 use std::collections::HashMap;
@@ -391,22 +391,25 @@ fn handle_run_container(
     args: Vec<String>,
     env: HashMap<String, String>,
     hostname: Option<String>,
+    limits: Option<ResourceLimits>,
 ) -> GuestMessage {
     let base_rootfs = Path::new("/var/lib/maclet/rootfs");
-    match Container::new(id.clone(), base_rootfs, command, args, env, hostname) {
+    match Container::new(id.clone(), base_rootfs, command, args, env, hostname, limits) {
         Ok(container) => {
             let res = match container.run() {
-                Ok(exec_res) => GuestMessage::ContainerResult {
+                Ok((exec_res, metrics)) => GuestMessage::ContainerResult {
                     id: id.clone(),
                     exit_code: exec_res.exit_code,
                     stdout: exec_res.stdout,
                     stderr: exec_res.stderr,
+                    metrics,
                 },
                 Err(e) => GuestMessage::ContainerResult {
                     id: id.clone(),
                     exit_code: 126,
                     stdout: String::new(),
                     stderr: format!("Failed to run container: {}\n", e),
+                    metrics: None,
                 },
             };
             container.cleanup();
@@ -417,6 +420,7 @@ fn handle_run_container(
             exit_code: 125,
             stdout: String::new(),
             stderr: format!("Failed to initialize container: {}\n", e),
+            metrics: None,
         },
     }
 }
@@ -429,6 +433,10 @@ fn run_agent() -> Result<()> {
             switch_to_tmpfs_root();
         };
     }
+
+    // Initialize cgroups v2 hierarchy
+    let cgroup_mgr = maclet_cgroups::CgroupV2Manager::new();
+    let _ = cgroup_mgr.init();
 
     ensure_base_rootfs();
 
@@ -467,10 +475,22 @@ fn run_agent() -> Result<()> {
                 args,
                 env,
                 hostname,
+                limits,
                 timeout_secs: _,
             } => {
-                let result = handle_run_container(id, command, args, env, hostname);
+                let result = handle_run_container(id, command, args, env, hostname, limits);
                 write_sync(&mut writer, &result)?;
+            }
+            HostMessage::InspectContainer { id } => {
+                let metrics = cgroup_mgr.read_metrics(&id).unwrap_or_default();
+                write_sync(
+                    &mut writer,
+                    &GuestMessage::InspectResult {
+                        id,
+                        state: "active".to_string(),
+                        metrics,
+                    },
+                )?;
             }
             HostMessage::Shutdown { id } => {
                 let _ = write_sync(&mut writer, &GuestMessage::Pong { id });

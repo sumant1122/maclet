@@ -58,6 +58,28 @@ enum Commands {
         /// Custom hostname for the container
         #[arg(long)]
         hostname: Option<String>,
+
+        /// Memory limit (e.g. 512m, 1g, 256m)
+        #[arg(long)]
+        memory: Option<String>,
+
+        /// CPU limit in number of vCPUs (e.g. 1.0, 0.5, 2.0)
+        #[arg(long)]
+        cpus: Option<f64>,
+
+        /// Maximum number of concurrent processes
+        #[arg(long = "pids-limit")]
+        pids_limit: Option<u64>,
+
+        /// Display cgroup v2 resource usage statistics upon completion
+        #[arg(long)]
+        stats: bool,
+    },
+
+    /// Inspect live resource metrics of a container
+    Inspect {
+        /// Container identifier
+        id: String,
     },
 
     /// Display version and environment information
@@ -439,12 +461,32 @@ async fn handle_exec(command: String, args: Vec<String>) -> Result<i32> {
     }
 }
 
-async fn handle_run(command: String, args: Vec<String>, hostname: Option<String>) -> Result<i32> {
+async fn handle_run(
+    command: String,
+    args: Vec<String>,
+    hostname: Option<String>,
+    memory: Option<String>,
+    cpus: Option<f64>,
+    pids_limit: Option<u64>,
+    show_stats: bool,
+) -> Result<i32> {
     let sock_p = socket_path();
     if !sock_p.exists() {
         return Err(anyhow!(
             "Maclet VM is not running. Start it with 'maclet machine start' first."
         ));
+    }
+
+    let mut limits = maclet_common::ResourceLimits::new();
+    if let Some(mem_str) = memory {
+        let bytes = maclet_common::parse_memory_bytes(&mem_str)?;
+        limits = limits.with_memory(bytes);
+    }
+    if let Some(cpu_val) = cpus {
+        limits = limits.with_cpus(cpu_val);
+    }
+    if let Some(pids) = pids_limit {
+        limits = limits.with_pids(pids);
     }
 
     let stream = UnixStream::connect(&sock_p)
@@ -461,12 +503,13 @@ async fn handle_run(command: String, args: Vec<String>, hostname: Option<String>
             .as_millis()
     );
     let req = HostMessage::RunContainer {
-        id: cnt_id,
+        id: cnt_id.clone(),
         image: "alpine".to_string(),
         command,
         args,
         env: HashMap::new(),
         hostname,
+        limits: Some(limits),
         timeout_secs: 60,
     };
 
@@ -475,10 +518,11 @@ async fn handle_run(command: String, args: Vec<String>, hostname: Option<String>
 
     match resp {
         Some(GuestMessage::ContainerResult {
-            id: _,
+            id,
             exit_code,
             stdout,
             stderr,
+            metrics,
         }) => {
             if !stdout.is_empty() {
                 print!("{}", stdout);
@@ -486,6 +530,36 @@ async fn handle_run(command: String, args: Vec<String>, hostname: Option<String>
             if !stderr.is_empty() {
                 eprint!("{}", stderr);
             }
+
+            if show_stats {
+                if let Some(m) = metrics {
+                    println!(
+                        "\n{}",
+                        format!("=== Resource Usage: {} ===", id).bold().cyan()
+                    );
+                    let mem_used_mb = m.memory_current as f64 / (1024.0 * 1024.0);
+                    let mem_max_str = m
+                        .memory_max
+                        .map(|b| format!("{:.1} MB", b as f64 / (1024.0 * 1024.0)))
+                        .unwrap_or_else(|| "unlimited".to_string());
+                    println!("Memory: {:.2} MB / {}", mem_used_mb, mem_max_str);
+
+                    let cpu_sec = m.cpu_usage_usec as f64 / 1_000_000.0;
+                    println!(
+                        "CPU Usage: {:.3}s (user: {:.3}s, sys: {:.3}s)",
+                        cpu_sec,
+                        m.cpu_user_usec as f64 / 1_000_000.0,
+                        m.cpu_system_usec as f64 / 1_000_000.0
+                    );
+
+                    let pids_max_str = m
+                        .pids_max
+                        .map(|p| p.to_string())
+                        .unwrap_or_else(|| "unlimited".to_string());
+                    println!("PIDs: {} / {}", m.pids_current, pids_max_str);
+                }
+            }
+
             Ok(exit_code)
         }
         Some(GuestMessage::Error { message, .. }) => {
@@ -494,6 +568,49 @@ async fn handle_run(command: String, args: Vec<String>, hostname: Option<String>
         }
         other => {
             eprintln!("Unexpected response from guest agent: {:?}", other);
+            Ok(1)
+        }
+    }
+}
+
+async fn handle_inspect(id: String) -> Result<i32> {
+    let sock_p = socket_path();
+    if !sock_p.exists() {
+        return Err(anyhow!("Maclet VM is not running."));
+    }
+
+    let stream = UnixStream::connect(&sock_p).await?;
+    let (r, mut w) = stream.into_split();
+    let mut buf_r = tokio::io::BufReader::new(r);
+
+    let req = HostMessage::InspectContainer { id: id.clone() };
+    write_async(&mut w, &req).await?;
+
+    let resp: Option<GuestMessage> = read_async(&mut buf_r).await?;
+    match resp {
+        Some(GuestMessage::InspectResult { id, state, metrics }) => {
+            println!(
+                "{}",
+                format!("=== Container Inspection: {} ===", id).bold().cyan()
+            );
+            println!("State: {}", state.green());
+            println!(
+                "Memory: {:.2} MB",
+                metrics.memory_current as f64 / (1024.0 * 1024.0)
+            );
+            println!(
+                "CPU Usage: {:.3}s",
+                metrics.cpu_usage_usec as f64 / 1_000_000.0
+            );
+            println!("PIDs: {}", metrics.pids_current);
+            Ok(0)
+        }
+        Some(GuestMessage::Error { message, .. }) => {
+            eprintln!("Inspect error: {}", message);
+            Ok(1)
+        }
+        _ => {
+            eprintln!("No inspection data received");
             Ok(1)
         }
     }
@@ -525,7 +642,16 @@ async fn main() -> ExitCode {
             MachineCommands::Status => handle_status().await.map(|_| 0),
         },
         Commands::Exec { command, args } => handle_exec(command, args).await,
-        Commands::Run { command, args, hostname } => handle_run(command, args, hostname).await,
+        Commands::Run {
+            command,
+            args,
+            hostname,
+            memory,
+            cpus,
+            pids_limit,
+            stats,
+        } => handle_run(command, args, hostname, memory, cpus, pids_limit, stats).await,
+        Commands::Inspect { id } => handle_inspect(id).await,
         Commands::Version => {
             handle_version();
             Ok(0)

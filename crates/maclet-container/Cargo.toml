@@ -8,5 +8,6 @@ license.workspace = true
 [dependencies]
 maclet-common = { path = "../maclet-common" }
 maclet-namespaces = { path = "../maclet-namespaces" }
+maclet-cgroups = { path = "../maclet-cgroups" }
 libc = "0.2"
 thiserror = "1.0"

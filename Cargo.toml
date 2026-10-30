@@ -7,6 +7,7 @@ members = [
     "crates/maclet-guest-agent",
     "crates/maclet-namespaces",
     "crates/maclet-container",
+    "crates/maclet-cgroups",
 ]
 resolver = "2"
 
