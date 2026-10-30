@@ -44,6 +44,22 @@ enum Commands {
         args: Vec<String>,
     },
 
+    /// Run an isolated Linux container with its own namespaces, rootfs, and pivot_root
+    #[command(trailing_var_arg = true)]
+    Run {
+        /// Container command to execute
+        #[arg(default_value = "/bin/sh")]
+        command: String,
+
+        /// Arguments for the command
+        #[arg(allow_hyphen_values = true)]
+        args: Vec<String>,
+
+        /// Custom hostname for the container
+        #[arg(long)]
+        hostname: Option<String>,
+    },
+
     /// Display version and environment information
     Version,
 }
@@ -126,10 +142,13 @@ async fn handle_init(cpus: usize, memory: u64) -> Result<()> {
     let kernel_path = kernel::ensure_kernel(&kernel_dir)?;
     println!("Kernel ready at: {}", kernel_path.display().to_string().green());
 
+    let rootfs_tar = initramfs::ensure_rootfs_tar(&kernel_dir)?;
+    println!("Base rootfs ready at: {}", rootfs_tar.display().to_string().green());
+
     let workspace_root = find_workspace_root()?;
     let guest_bin = initramfs::build_guest_agent(&workspace_root)?;
     let initramfs_path = kernel_dir.join("initrd.img");
-    initramfs::create_initramfs(&guest_bin, &initramfs_path)?;
+    initramfs::create_initramfs(&guest_bin, &rootfs_tar, &initramfs_path)?;
 
     let config = VmConfig {
         cpu_count: cpus,
@@ -420,6 +439,66 @@ async fn handle_exec(command: String, args: Vec<String>) -> Result<i32> {
     }
 }
 
+async fn handle_run(command: String, args: Vec<String>, hostname: Option<String>) -> Result<i32> {
+    let sock_p = socket_path();
+    if !sock_p.exists() {
+        return Err(anyhow!(
+            "Maclet VM is not running. Start it with 'maclet machine start' first."
+        ));
+    }
+
+    let stream = UnixStream::connect(&sock_p)
+        .await
+        .context("Failed to connect to Maclet VM control socket")?;
+
+    let (r, mut w) = stream.into_split();
+    let mut buf_r = tokio::io::BufReader::new(r);
+
+    let cnt_id = format!(
+        "cnt-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_millis()
+    );
+    let req = HostMessage::RunContainer {
+        id: cnt_id,
+        image: "alpine".to_string(),
+        command,
+        args,
+        env: HashMap::new(),
+        hostname,
+        timeout_secs: 60,
+    };
+
+    write_async(&mut w, &req).await?;
+    let resp: Option<GuestMessage> = read_async(&mut buf_r).await?;
+
+    match resp {
+        Some(GuestMessage::ContainerResult {
+            id: _,
+            exit_code,
+            stdout,
+            stderr,
+        }) => {
+            if !stdout.is_empty() {
+                print!("{}", stdout);
+            }
+            if !stderr.is_empty() {
+                eprint!("{}", stderr);
+            }
+            Ok(exit_code)
+        }
+        Some(GuestMessage::Error { message, .. }) => {
+            eprintln!("Container execution error: {}", message);
+            Ok(1)
+        }
+        other => {
+            eprintln!("Unexpected response from guest agent: {:?}", other);
+            Ok(1)
+        }
+    }
+}
+
 fn handle_version() {
     println!("{} {}", "maclet".bold(), env!("CARGO_PKG_VERSION"));
     println!("Architecture: {}", std::env::consts::ARCH);
@@ -446,6 +525,7 @@ async fn main() -> ExitCode {
             MachineCommands::Status => handle_status().await.map(|_| 0),
         },
         Commands::Exec { command, args } => handle_exec(command, args).await,
+        Commands::Run { command, args, hostname } => handle_run(command, args, hostname).await,
         Commands::Version => {
             handle_version();
             Ok(0)

@@ -69,6 +69,36 @@ async fn test_vm_boot_and_handshake_and_exec() {
         panic!("Expected ExecResult, got {:?}", exec_res);
     }
 
+    // Phase 2: Run an isolated container
+    write_async(
+        &mut guest_writer,
+        &HostMessage::RunContainer {
+            id: "e2e-cnt".to_string(),
+            image: "alpine".to_string(),
+            command: "/bin/sh".to_string(),
+            args: vec![
+                "-c".to_string(),
+                "echo PID: $$; hostname; cat /etc/os-release".to_string(),
+            ],
+            env: HashMap::new(),
+            hostname: Some("test-e2e-box".to_string()),
+            timeout_secs: 20,
+        },
+    )
+    .await
+    .unwrap();
+
+    let cnt_res: Option<GuestMessage> = read_async(&mut guest_buf_reader).await.unwrap();
+    if let Some(GuestMessage::ContainerResult { id, exit_code, stdout, stderr }) = cnt_res {
+        assert_eq!(id, "e2e-cnt");
+        assert_eq!(exit_code, 0, "Container failed with stderr: {}", stderr);
+        assert!(stdout.contains("PID: 1"), "PID was not 1: {}", stdout);
+        assert!(stdout.contains("test-e2e-box"), "Hostname mismatch: {}", stdout);
+        assert!(stdout.contains("Alpine Linux"), "Missing OS release: {}", stdout);
+    } else {
+        panic!("Expected ContainerResult, got {:?}", cnt_res);
+    }
+
     // Graceful stop
     vm.stop().expect("Failed to stop VM");
 }

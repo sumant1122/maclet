@@ -90,7 +90,7 @@ make test
 ### Usage
 
 ```bash
-# 1. Initialize environment (prepares Linux kernel & builds static guest agent)
+# 1. Initialize environment (prepares Linux kernel, minirootfs & builds static guest agent)
 ./target/release/maclet machine init
 
 # 2. Start the Linux micro-VM in the background
@@ -99,14 +99,16 @@ make test
 # 3. Check VM and guest agent status
 ./target/release/maclet machine status
 
-# 4. Execute commands directly inside the real Linux kernel
-./target/release/maclet exec uname -a
-./target/release/maclet exec cat /proc/version
-./target/release/maclet exec cat /proc/cpuinfo
-./target/release/maclet exec cat /proc/meminfo
-./target/release/maclet exec uptime
+# 4. Run an isolated container (genuine PID, Mount, UTS, IPC namespaces + pivot_root)
+./target/release/maclet run /bin/sh -c "echo PID: \$\$; hostname; ps -ef"
 
-# 5. Stop the virtual machine gracefully
+# Run a container with a custom hostname
+./target/release/maclet run --hostname my-isolated-container /bin/sh -c "hostname; cat /etc/os-release"
+
+# 5. Execute commands in the host Linux VM directly
+./target/release/maclet exec uname -a
+
+# 6. Stop the virtual machine gracefully
 ./target/release/maclet machine stop
 ```
 

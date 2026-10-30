@@ -5,6 +5,8 @@ members = [
     "crates/maclet-vm",
     "crates/maclet-cli",
     "crates/maclet-guest-agent",
+    "crates/maclet-namespaces",
+    "crates/maclet-container",
 ]
 resolver = "2"
 

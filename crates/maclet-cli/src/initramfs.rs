@@ -7,10 +7,31 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+const ROOTFS_URL: &str =
+    "https://dl-cdn.alpinelinux.org/alpine/v3.20/releases/aarch64/alpine-minirootfs-3.20.0-aarch64.tar.gz";
+
+pub fn ensure_rootfs_tar(kernel_dir: &Path) -> Result<PathBuf> {
+    let target_tar = kernel_dir.join("rootfs.tar.gz");
+    if target_tar.exists() {
+        return Ok(target_tar);
+    }
+
+    println!("Downloading minimal Linux root filesystem (Alpine ARM64 minirootfs)...");
+    let status = Command::new("curl")
+        .args(["-sSL", ROOTFS_URL, "-o", target_tar.to_str().unwrap()])
+        .status()
+        .context("Failed to download minirootfs")?;
+
+    if !status.success() {
+        return Err(anyhow!("Failed to download rootfs with status {}", status));
+    }
+
+    Ok(target_tar)
+}
+
 pub fn build_guest_agent(workspace_root: &Path) -> Result<PathBuf> {
     println!("Building static Linux ARM64 guest agent (aarch64-unknown-linux-musl)...");
 
-    // Find rust-lld or gcc-ld in toolchain
     let sysroot_out = Command::new("rustc")
         .args(["--print", "sysroot"])
         .output()
@@ -52,12 +73,17 @@ pub fn build_guest_agent(workspace_root: &Path) -> Result<PathBuf> {
     Ok(binary)
 }
 
-pub fn create_initramfs(agent_binary: &Path, output_path: &Path) -> Result<()> {
-    println!("Packaging initramfs with /init guest agent...");
+pub fn create_initramfs(agent_binary: &Path, rootfs_tar: &Path, output_path: &Path) -> Result<()> {
+    println!("Packaging initramfs with /init and rootfs.tar.gz...");
     let mut file = File::open(agent_binary)
         .context("Failed to open guest agent binary")?;
     let mut agent_data = Vec::new();
     file.read_to_end(&mut agent_data)?;
+
+    let mut rootfs_file = File::open(rootfs_tar)
+        .context("Failed to open rootfs.tar.gz")?;
+    let mut rootfs_data = Vec::new();
+    rootfs_file.read_to_end(&mut rootfs_data)?;
 
     let out_file = File::create(output_path)
         .context("Failed to create initrd.img output file")?;
@@ -65,12 +91,15 @@ pub fn create_initramfs(agent_binary: &Path, output_path: &Path) -> Result<()> {
     let mut cpio = CpioWriter::new(gz);
 
     // Standard directories (mode 0o040755)
-    for dir in &["proc", "sys", "dev", "tmp", "bin", "etc"] {
+    for dir in &["proc", "sys", "dev", "tmp", "bin", "etc", "var", "var/lib", "var/lib/maclet"] {
         cpio.write_entry(dir, 0o040755, 0, 0, &[])?;
     }
 
     // Write /init
     cpio.write_entry("init", 0o100755, 0, 0, &agent_data)?;
+
+    // Write /rootfs.tar.gz
+    cpio.write_entry("rootfs.tar.gz", 0o100644, 0, 0, &rootfs_data)?;
 
     let mut gz_done = cpio.finish()?;
     use std::io::Write;

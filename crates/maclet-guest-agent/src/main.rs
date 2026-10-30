@@ -1,18 +1,41 @@
+use flate2::read::GzDecoder;
 use maclet_common::{GuestMessage, HostMessage, Result};
+use maclet_container::Container;
 use maclet_ipc::{read_sync, write_sync};
-use std::fs::{File, OpenOptions};
+use std::collections::HashMap;
+use std::fs::{self, File, OpenOptions};
 use std::io::{BufReader, BufWriter};
-#[cfg(target_os = "linux")]
 use std::path::Path;
 use std::process::Command;
 use std::thread::sleep;
 use std::time::{Duration, Instant};
+use tar::Archive;
+
+#[cfg(target_os = "linux")]
+#[repr(C)]
+struct Termios {
+    c_iflag: u32,
+    c_oflag: u32,
+    c_cflag: u32,
+    c_lflag: u32,
+    c_line: u8,
+    c_cc: [u8; 32],
+    c_ispeed: u32,
+    c_ospeed: u32,
+}
+
+#[cfg(target_os = "linux")]
+extern "C" {
+    fn tcgetattr(fd: i32, termios_p: *mut Termios) -> i32;
+    fn tcsetattr(fd: i32, optional_actions: i32, termios_p: *const Termios) -> i32;
+    fn cfmakeraw(termios_p: *mut Termios);
+}
 
 #[cfg(target_os = "linux")]
 unsafe fn mount_pseudo_filesystems() {
     // Mount proc
     if !Path::new("/proc/uptime").exists() {
-        let _ = std::fs::create_dir_all("/proc");
+        let _ = fs::create_dir_all("/proc");
         libc_mount(
             b"proc\0".as_ptr(),
             b"/proc\0".as_ptr(),
@@ -23,7 +46,7 @@ unsafe fn mount_pseudo_filesystems() {
     }
     // Mount sysfs
     if !Path::new("/sys/kernel").exists() {
-        let _ = std::fs::create_dir_all("/sys");
+        let _ = fs::create_dir_all("/sys");
         libc_mount(
             b"sysfs\0".as_ptr(),
             b"/sys\0".as_ptr(),
@@ -34,13 +57,110 @@ unsafe fn mount_pseudo_filesystems() {
     }
     // Mount devtmpfs
     if !Path::new("/dev/null").exists() {
-        let _ = std::fs::create_dir_all("/dev");
+        let _ = fs::create_dir_all("/dev");
         libc_mount(
             b"devtmpfs\0".as_ptr(),
             b"/dev\0".as_ptr(),
             b"devtmpfs\0".as_ptr(),
             0,
             std::ptr::null(),
+        );
+    }
+}
+
+#[cfg(target_os = "linux")]
+unsafe fn switch_to_tmpfs_root() {
+    let mountinfo = fs::read_to_string("/proc/self/mountinfo").unwrap_or_default();
+    if !mountinfo.contains("rootfs / rootfs") {
+        return;
+    }
+
+    // 1. Create /sysroot
+    let _ = fs::create_dir_all("/sysroot");
+    let sysroot_c = b"/sysroot\0".as_ptr();
+    let tmpfs_c = b"tmpfs\0".as_ptr();
+
+    if libc::mount(tmpfs_c, sysroot_c, tmpfs_c, 0, std::ptr::null()) != 0 {
+        eprintln!(
+            "[Init] Failed to mount tmpfs on /sysroot: {}",
+            std::io::Error::last_os_error()
+        );
+        return;
+    }
+
+    // 2. Unpack /rootfs.tar.gz into /sysroot if present
+    if Path::new("/rootfs.tar.gz").exists() {
+        if let Ok(f) = File::open("/rootfs.tar.gz") {
+            let gz = GzDecoder::new(f);
+            let mut archive = Archive::new(gz);
+            let _ = archive.unpack("/sysroot");
+        }
+    }
+
+    // Also populate base rootfs for containers
+    let base_dir = "/sysroot/var/lib/maclet/rootfs";
+    let _ = fs::create_dir_all(base_dir);
+    if Path::new("/rootfs.tar.gz").exists() {
+        if let Ok(f) = File::open("/rootfs.tar.gz") {
+            let gz = GzDecoder::new(f);
+            let mut archive = Archive::new(gz);
+            let _ = archive.unpack(base_dir);
+        }
+    }
+
+    let _ = fs::create_dir_all("/sysroot/proc");
+    let _ = fs::create_dir_all("/sysroot/sys");
+    let _ = fs::create_dir_all("/sysroot/dev");
+
+    // 3. Move pseudo filesystems to /sysroot
+    let proc_c = b"/proc\0".as_ptr();
+    let sys_c = b"/sys\0".as_ptr();
+    let dev_c = b"/dev\0".as_ptr();
+
+    let sysroot_proc = b"/sysroot/proc\0".as_ptr();
+    let sysroot_sys = b"/sysroot/sys\0".as_ptr();
+    let sysroot_dev = b"/sysroot/dev\0".as_ptr();
+
+    libc::mount(
+        proc_c,
+        sysroot_proc,
+        std::ptr::null(),
+        libc::MS_MOVE,
+        std::ptr::null(),
+    );
+    libc::mount(
+        sys_c,
+        sysroot_sys,
+        std::ptr::null(),
+        libc::MS_MOVE,
+        std::ptr::null(),
+    );
+    libc::mount(
+        dev_c,
+        sysroot_dev,
+        std::ptr::null(),
+        libc::MS_MOVE,
+        std::ptr::null(),
+    );
+
+    // 4. Move /sysroot over /
+    let slash_c = b"/\0".as_ptr();
+    let dot_c = b".\0".as_ptr();
+
+    if libc::mount(
+        sysroot_c,
+        slash_c,
+        std::ptr::null(),
+        libc::MS_MOVE,
+        std::ptr::null(),
+    ) == 0
+    {
+        libc::chroot(dot_c);
+        libc::chdir(slash_c);
+    } else {
+        eprintln!(
+            "[Init] Failed to MS_MOVE /sysroot to /: {}",
+            std::io::Error::last_os_error()
         );
     }
 }
@@ -70,32 +190,11 @@ fn ensure_device_nodes() {
     #[cfg(target_os = "linux")]
     unsafe {
         if !Path::new("/dev/hvc1").exists() {
-            let _ = std::fs::create_dir_all("/dev");
-            // hvc major is 229, hvc1 is minor 1
+            let _ = fs::create_dir_all("/dev");
             let dev_id = (229 << 8) | 1;
             libc_mknod(b"/dev/hvc1\0".as_ptr(), 0o20666, dev_id);
         }
     }
-}
-
-#[cfg(target_os = "linux")]
-#[repr(C)]
-struct Termios {
-    c_iflag: u32,
-    c_oflag: u32,
-    c_cflag: u32,
-    c_lflag: u32,
-    c_line: u8,
-    c_cc: [u8; 32],
-    c_ispeed: u32,
-    c_ospeed: u32,
-}
-
-#[cfg(target_os = "linux")]
-extern "C" {
-    fn tcgetattr(fd: i32, termios_p: *mut Termios) -> i32;
-    fn tcsetattr(fd: i32, optional_actions: i32, termios_p: *const Termios) -> i32;
-    fn cfmakeraw(termios_p: *mut Termios);
 }
 
 fn open_channel() -> std::io::Result<File> {
@@ -129,7 +228,7 @@ fn open_channel() -> std::io::Result<File> {
 }
 
 fn get_uptime_secs() -> u64 {
-    std::fs::read_to_string("/proc/uptime")
+    fs::read_to_string("/proc/uptime")
         .ok()
         .and_then(|s| {
             s.split_whitespace()
@@ -138,6 +237,25 @@ fn get_uptime_secs() -> u64 {
         })
         .map(|v| v as u64)
         .unwrap_or(0)
+}
+
+fn ensure_base_rootfs() {
+    let target_dir = Path::new("/var/lib/maclet/rootfs");
+    if target_dir.join("bin/sh").exists() {
+        return;
+    }
+
+    let archive_path = Path::new("/rootfs.tar.gz");
+    if !archive_path.exists() {
+        return;
+    }
+
+    let _ = fs::create_dir_all(target_dir);
+    if let Ok(f) = File::open(archive_path) {
+        let gz = GzDecoder::new(f);
+        let mut archive = Archive::new(gz);
+        let _ = archive.unpack(target_dir);
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -161,7 +279,7 @@ fn handle_exec(
     id: String,
     cmd_name: String,
     args: Vec<String>,
-    env: std::collections::HashMap<String, String>,
+    env: HashMap<String, String>,
 ) -> GuestMessage {
     // 1. Built-in command fallbacks
     match cmd_name.as_str() {
@@ -170,20 +288,29 @@ fn handle_exec(
             unsafe {
                 let mut u: libc_utsname = std::mem::zeroed();
                 if libc_uname(&mut u) == 0 {
-                    let sysname = std::ffi::CStr::from_ptr(u.sysname.as_ptr() as *const _).to_string_lossy();
-                    let nodename = std::ffi::CStr::from_ptr(u.nodename.as_ptr() as *const _).to_string_lossy();
-                    let release = std::ffi::CStr::from_ptr(u.release.as_ptr() as *const _).to_string_lossy();
-                    let version = std::ffi::CStr::from_ptr(u.version.as_ptr() as *const _).to_string_lossy();
-                    let machine = std::ffi::CStr::from_ptr(u.machine.as_ptr() as *const _).to_string_lossy();
-                    let out = if args.contains(&"-a".to_string()) || args.contains(&"-all".to_string()) {
-                        format!("{} {} {} {} {}\n", sysname, nodename, release, version, machine)
-                    } else if args.contains(&"-r".to_string()) {
-                        format!("{}\n", release)
-                    } else if args.contains(&"-m".to_string()) {
-                        format!("{}\n", machine)
-                    } else {
-                        format!("{}\n", sysname)
-                    };
+                    let sysname =
+                        std::ffi::CStr::from_ptr(u.sysname.as_ptr() as *const _).to_string_lossy();
+                    let nodename =
+                        std::ffi::CStr::from_ptr(u.nodename.as_ptr() as *const _).to_string_lossy();
+                    let release =
+                        std::ffi::CStr::from_ptr(u.release.as_ptr() as *const _).to_string_lossy();
+                    let version =
+                        std::ffi::CStr::from_ptr(u.version.as_ptr() as *const _).to_string_lossy();
+                    let machine =
+                        std::ffi::CStr::from_ptr(u.machine.as_ptr() as *const _).to_string_lossy();
+                    let out =
+                        if args.contains(&"-a".to_string()) || args.contains(&"-all".to_string()) {
+                            format!(
+                                "{} {} {} {} {}\n",
+                                sysname, nodename, release, version, machine
+                            )
+                        } else if args.contains(&"-r".to_string()) {
+                            format!("{}\n", release)
+                        } else if args.contains(&"-m".to_string()) {
+                            format!("{}\n", machine)
+                        } else {
+                            format!("{}\n", sysname)
+                        };
                     return GuestMessage::ExecResult {
                         id,
                         exit_code: 0,
@@ -212,7 +339,7 @@ fn handle_exec(
         }
         "cat" => {
             if let Some(path) = args.first() {
-                match std::fs::read_to_string(path) {
+                match fs::read_to_string(path) {
                     Ok(content) => {
                         return GuestMessage::ExecResult {
                             id,
@@ -258,11 +385,52 @@ fn handle_exec(
     }
 }
 
+fn handle_run_container(
+    id: String,
+    command: String,
+    args: Vec<String>,
+    env: HashMap<String, String>,
+    hostname: Option<String>,
+) -> GuestMessage {
+    let base_rootfs = Path::new("/var/lib/maclet/rootfs");
+    match Container::new(id.clone(), base_rootfs, command, args, env, hostname) {
+        Ok(container) => {
+            let res = match container.run() {
+                Ok(exec_res) => GuestMessage::ContainerResult {
+                    id: id.clone(),
+                    exit_code: exec_res.exit_code,
+                    stdout: exec_res.stdout,
+                    stderr: exec_res.stderr,
+                },
+                Err(e) => GuestMessage::ContainerResult {
+                    id: id.clone(),
+                    exit_code: 126,
+                    stdout: String::new(),
+                    stderr: format!("Failed to run container: {}\n", e),
+                },
+            };
+            container.cleanup();
+            res
+        }
+        Err(e) => GuestMessage::ContainerResult {
+            id,
+            exit_code: 125,
+            stdout: String::new(),
+            stderr: format!("Failed to initialize container: {}\n", e),
+        },
+    }
+}
+
 fn run_agent() -> Result<()> {
     #[cfg(target_os = "linux")]
     if std::process::id() == 1 {
-        unsafe { mount_pseudo_filesystems() };
+        unsafe {
+            mount_pseudo_filesystems();
+            switch_to_tmpfs_root();
+        };
     }
+
+    ensure_base_rootfs();
 
     let file = open_channel()?;
     let mut reader = BufReader::new(file.try_clone()?);
@@ -292,6 +460,18 @@ fn run_agent() -> Result<()> {
                 let result = handle_exec(id, command, args, env);
                 write_sync(&mut writer, &result)?;
             }
+            HostMessage::RunContainer {
+                id,
+                image: _,
+                command,
+                args,
+                env,
+                hostname,
+                timeout_secs: _,
+            } => {
+                let result = handle_run_container(id, command, args, env, hostname);
+                write_sync(&mut writer, &result)?;
+            }
             HostMessage::Shutdown { id } => {
                 let _ = write_sync(&mut writer, &GuestMessage::Pong { id });
                 #[cfg(target_os = "linux")]
@@ -311,7 +491,6 @@ fn main() {
         eprintln!("[maclet-guest-agent] Fatal error: {}", e);
     }
 
-    // If running as PID 1, never exit (which causes kernel panic)
     if std::process::id() == 1 {
         loop {
             sleep(Duration::from_secs(60));

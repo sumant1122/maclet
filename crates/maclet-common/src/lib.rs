@@ -43,6 +43,22 @@ pub enum HostMessage {
         timeout_secs: u64,
     },
 
+    #[serde(rename = "run_container")]
+    RunContainer {
+        id: String,
+        #[serde(default)]
+        image: String,
+        command: String,
+        #[serde(default)]
+        args: Vec<String>,
+        #[serde(default)]
+        env: HashMap<String, String>,
+        #[serde(default)]
+        hostname: Option<String>,
+        #[serde(default = "default_timeout")]
+        timeout_secs: u64,
+    },
+
     #[serde(rename = "shutdown")]
     Shutdown { id: String },
 }
@@ -67,6 +83,14 @@ pub enum GuestMessage {
 
     #[serde(rename = "exec_result")]
     ExecResult {
+        id: String,
+        exit_code: i32,
+        stdout: String,
+        stderr: String,
+    },
+
+    #[serde(rename = "container_result")]
+    ContainerResult {
         id: String,
         exit_code: i32,
         stdout: String,
@@ -138,5 +162,33 @@ mod tests {
 
         let deserialized: GuestMessage = serde_json::from_str(&serialized).unwrap();
         assert_eq!(msg, deserialized);
+    }
+
+    #[test]
+    fn test_container_message_serialization() {
+        let host_msg = HostMessage::RunContainer {
+            id: "cnt-1".to_string(),
+            image: "alpine".to_string(),
+            command: "/bin/sh".to_string(),
+            args: vec!["-c".to_string(), "echo hi".to_string()],
+            env: HashMap::new(),
+            hostname: Some("mybox".to_string()),
+            timeout_secs: 30,
+        };
+        let s = serde_json::to_string(&host_msg).unwrap();
+        assert!(s.contains("\"type\":\"run_container\""));
+        let d: HostMessage = serde_json::from_str(&s).unwrap();
+        assert_eq!(host_msg, d);
+
+        let guest_msg = GuestMessage::ContainerResult {
+            id: "cnt-1".to_string(),
+            exit_code: 0,
+            stdout: "hi\n".to_string(),
+            stderr: String::new(),
+        };
+        let s2 = serde_json::to_string(&guest_msg).unwrap();
+        assert!(s2.contains("\"type\":\"container_result\""));
+        let d2: GuestMessage = serde_json::from_str(&s2).unwrap();
+        assert_eq!(guest_msg, d2);
     }
 }

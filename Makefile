@@ -18,7 +18,7 @@ release:
 	codesign --sign - --entitlements $(ENTITLEMENTS) --force $(CLI_RELEASE)
 
 test:
-	cargo test --workspace
+	cargo test --workspace --bins --lib
 	cargo test --package maclet-cli --test test_e2e_boot --no-run
 	@for f in target/debug/deps/test_e2e_boot-*; do \
 		if [ -x "$$f" ]; then \

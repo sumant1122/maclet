@@ -1,0 +1,11 @@
+[package]
+name = "maclet-namespaces"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+maclet-common = { path = "../maclet-common" }
+libc = "0.2"
+thiserror = "1.0"
