@@ -1,6 +1,8 @@
 use maclet_cgroups::CgroupV2Manager;
 use maclet_common::{CgroupMetrics, ResourceLimits, Result};
-use maclet_namespaces::{run_in_isolated_namespaces, ContainerConfig, ExecutionResult};
+use maclet_namespaces::{
+    run_in_isolated_namespaces, spawn_isolated_namespaces, ContainerConfig, ExecutionResult,
+};
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -87,6 +89,20 @@ impl Container {
         let metrics = self.cgroup_mgr.read_metrics(&self.id).ok();
 
         Ok((exec_result, metrics))
+    }
+
+    pub fn spawn_detached(&self, log_path: &Path, exit_file: &Path) -> Result<(u32, u32)> {
+        let config = ContainerConfig {
+            id: self.id.clone(),
+            hostname: self.hostname.clone(),
+            rootfs: self.rootfs.clone(),
+            command: self.command.clone(),
+            args: self.args.clone(),
+            env: self.env.clone(),
+            cgroup_path: self.cgroup_path.clone(),
+        };
+
+        spawn_isolated_namespaces(&config, log_path, exit_file)
     }
 
     pub fn cleanup(&self) {

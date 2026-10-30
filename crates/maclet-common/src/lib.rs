@@ -99,6 +99,64 @@ pub fn parse_memory_bytes(input: &str) -> Result<u64> {
     Ok(val * multiplier)
 }
 
+/// Container lifecycle status
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ContainerStatus {
+    Created,
+    Running,
+    Stopped,
+    Exited,
+}
+
+impl std::fmt::Display for ContainerStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Created => write!(f, "Created"),
+            Self::Running => write!(f, "Up"),
+            Self::Stopped => write!(f, "Stopped"),
+            Self::Exited => write!(f, "Exited"),
+        }
+    }
+}
+
+/// Compact container info for listing
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ContainerInfo {
+    pub id: String,
+    pub name: String,
+    pub image: String,
+    pub command: String,
+    pub status: ContainerStatus,
+    pub created_at: u64,
+    pub pid: Option<u32>,
+    pub exit_code: Option<i32>,
+    pub memory_current: Option<u64>,
+    pub memory_max: Option<u64>,
+}
+
+/// Detailed container metadata for inspection
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ContainerInspectDetails {
+    pub id: String,
+    pub name: String,
+    pub image: String,
+    pub command: String,
+    pub args: Vec<String>,
+    pub env: HashMap<String, String>,
+    pub hostname: String,
+    pub status: ContainerStatus,
+    pub created_at: u64,
+    pub started_at: Option<u64>,
+    pub finished_at: Option<u64>,
+    pub pid: Option<u32>,
+    pub exit_code: Option<i32>,
+    pub limits: Option<ResourceLimits>,
+    pub metrics: Option<CgroupMetrics>,
+    pub rootfs_path: String,
+    pub log_path: String,
+}
+
 /// Commands and requests sent from macOS Host to Linux Guest Agent
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type")]
@@ -122,6 +180,8 @@ pub enum HostMessage {
     RunContainer {
         id: String,
         #[serde(default)]
+        name: Option<String>,
+        #[serde(default)]
         image: String,
         command: String,
         #[serde(default)]
@@ -132,8 +192,47 @@ pub enum HostMessage {
         hostname: Option<String>,
         #[serde(default)]
         limits: Option<ResourceLimits>,
+        #[serde(default)]
+        detached: bool,
         #[serde(default = "default_timeout")]
         timeout_secs: u64,
+    },
+
+    #[serde(rename = "list_containers")]
+    ListContainers {
+        #[serde(default)]
+        all: bool,
+    },
+
+    #[serde(rename = "stop_container")]
+    StopContainer {
+        id: String,
+        #[serde(default = "default_stop_timeout")]
+        timeout_secs: u64,
+    },
+
+    #[serde(rename = "remove_container")]
+    RemoveContainer {
+        id: String,
+        #[serde(default)]
+        force: bool,
+    },
+
+    #[serde(rename = "container_logs")]
+    ContainerLogs {
+        id: String,
+        #[serde(default)]
+        tail: Option<usize>,
+    },
+
+    #[serde(rename = "exec_in_container")]
+    ExecInContainer {
+        id: String,
+        command: String,
+        #[serde(default)]
+        args: Vec<String>,
+        #[serde(default)]
+        env: HashMap<String, String>,
     },
 
     #[serde(rename = "inspect_container")]
@@ -145,6 +244,10 @@ pub enum HostMessage {
 
 fn default_timeout() -> u64 {
     30
+}
+
+fn default_stop_timeout() -> u64 {
+    10
 }
 
 /// Events and responses sent from Linux Guest Agent to macOS Host
@@ -169,6 +272,13 @@ pub enum GuestMessage {
         stderr: String,
     },
 
+    #[serde(rename = "container_started")]
+    ContainerStarted {
+        id: String,
+        pid: u32,
+        name: String,
+    },
+
     #[serde(rename = "container_result")]
     ContainerResult {
         id: String,
@@ -179,11 +289,40 @@ pub enum GuestMessage {
         metrics: Option<CgroupMetrics>,
     },
 
+    #[serde(rename = "container_list")]
+    ContainerList {
+        containers: Vec<ContainerInfo>,
+    },
+
+    #[serde(rename = "container_stopped")]
+    ContainerStopped {
+        id: String,
+        exit_code: Option<i32>,
+    },
+
+    #[serde(rename = "container_removed")]
+    ContainerRemoved {
+        id: String,
+    },
+
+    #[serde(rename = "container_logs_result")]
+    ContainerLogsResult {
+        id: String,
+        logs: String,
+    },
+
+    #[serde(rename = "container_exec_result")]
+    ContainerExecResult {
+        id: String,
+        exit_code: i32,
+        stdout: String,
+        stderr: String,
+    },
+
     #[serde(rename = "inspect_result")]
     InspectResult {
         id: String,
-        state: String,
-        metrics: CgroupMetrics,
+        details: Box<ContainerInspectDetails>,
     },
 
     #[serde(rename = "error")]
@@ -277,16 +416,19 @@ mod tests {
     fn test_container_message_serialization() {
         let host_msg = HostMessage::RunContainer {
             id: "cnt-1".to_string(),
+            name: Some("test-box".to_string()),
             image: "alpine".to_string(),
             command: "/bin/sh".to_string(),
             args: vec!["-c".to_string(), "echo hi".to_string()],
             env: HashMap::new(),
             hostname: Some("mybox".to_string()),
             limits: Some(ResourceLimits::new().with_pids(50)),
+            detached: true,
             timeout_secs: 30,
         };
         let s = serde_json::to_string(&host_msg).unwrap();
         assert!(s.contains("\"type\":\"run_container\""));
+        assert!(s.contains("\"detached\":true"));
         let d: HostMessage = serde_json::from_str(&s).unwrap();
         assert_eq!(host_msg, d);
 
@@ -309,5 +451,24 @@ mod tests {
         assert!(s2.contains("\"type\":\"container_result\""));
         let d2: GuestMessage = serde_json::from_str(&s2).unwrap();
         assert_eq!(guest_msg, d2);
+
+        let list_msg = GuestMessage::ContainerList {
+            containers: vec![ContainerInfo {
+                id: "c1".to_string(),
+                name: "c1-name".to_string(),
+                image: "alpine".to_string(),
+                command: "/bin/sh".to_string(),
+                status: ContainerStatus::Running,
+                created_at: 1000,
+                pid: Some(1234),
+                exit_code: None,
+                memory_current: Some(1024 * 1024),
+                memory_max: Some(64 * 1024 * 1024),
+            }],
+        };
+        let s3 = serde_json::to_string(&list_msg).unwrap();
+        assert!(s3.contains("\"type\":\"container_list\""));
+        let d3: GuestMessage = serde_json::from_str(&s3).unwrap();
+        assert_eq!(list_msg, d3);
     }
 }

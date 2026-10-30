@@ -4,9 +4,7 @@ use std::collections::HashMap;
 use std::ffi::CString;
 #[cfg(target_os = "linux")]
 use std::fs;
-#[cfg(target_os = "linux")]
-use std::path::Path;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone)]
 pub struct ContainerConfig {
@@ -32,6 +30,344 @@ const SYS_PIVOT_ROOT: i64 = 41; // __NR_pivot_root on arm64
 #[cfg(target_os = "linux")]
 unsafe fn pivot_root_syscall(new_root: *const libc::c_char, put_old: *const libc::c_char) -> i32 {
     libc::syscall(SYS_PIVOT_ROOT, new_root, put_old) as i32
+}
+
+/// Spawns an isolated container in background (detached mode).
+/// Returns (supervisor_pid, container_init_pid).
+pub fn spawn_isolated_namespaces(
+    config: &ContainerConfig,
+    log_path: &Path,
+    exit_file: &Path,
+) -> Result<(u32, u32)> {
+    #[cfg(target_os = "linux")]
+    return spawn_linux_namespaces(config, log_path, exit_file);
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (config, log_path, exit_file);
+        Err(MacletError::Guest(
+            "Linux namespaces are only supported on Linux target".to_string(),
+        ))
+    }
+}
+
+/// Executes a command inside an already running container by joining its namespaces via setns().
+pub fn exec_in_existing_container(
+    container_pid: u32,
+    command: &str,
+    args: &[String],
+    env: &HashMap<String, String>,
+) -> Result<ExecutionResult> {
+    #[cfg(target_os = "linux")]
+    return exec_linux_namespaces(container_pid, command, args, env);
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (container_pid, command, args, env);
+        Err(MacletError::Guest(
+            "Linux namespaces are only supported on Linux target".to_string(),
+        ))
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn spawn_linux_namespaces(
+    config: &ContainerConfig,
+    log_path: &Path,
+    exit_file: &Path,
+) -> Result<(u32, u32)> {
+    let mut pid_pipe = [0i32; 2];
+    unsafe {
+        if libc::pipe(pid_pipe.as_mut_ptr()) != 0 {
+            return Err(MacletError::Io(std::io::Error::last_os_error()));
+        }
+    }
+
+    let intermediate_pid = unsafe { libc::fork() };
+    if intermediate_pid < 0 {
+        return Err(MacletError::Io(std::io::Error::last_os_error()));
+    }
+
+    if intermediate_pid == 0 {
+        // --- Intermediate Supervisor Process ---
+        unsafe {
+            libc::close(pid_pipe[0]);
+            // Create a new session so supervisor is detached
+            libc::setsid();
+        }
+
+        let clone_flags = libc::CLONE_NEWNS
+            | libc::CLONE_NEWUTS
+            | libc::CLONE_NEWIPC
+            | libc::CLONE_NEWPID;
+
+        let ret = unsafe { libc::unshare(clone_flags) };
+        if ret != 0 {
+            unsafe {
+                libc::close(pid_pipe[1]);
+                libc::_exit(1);
+            }
+        }
+
+        let container_pid = unsafe { libc::fork() };
+        if container_pid < 0 {
+            unsafe {
+                libc::close(pid_pipe[1]);
+                libc::_exit(1);
+            }
+        }
+
+        if container_pid == 0 {
+            // --- Container Init Process (PID 1 inside container PID namespace) ---
+            unsafe {
+                libc::close(pid_pipe[1]);
+            }
+
+            if let Some(ref cg) = config.cgroup_path {
+                let procs_file = cg.join("cgroup.procs");
+                let _ = fs::write(procs_file, "0\n");
+                unsafe {
+                    let _ = libc::unshare(libc::CLONE_NEWCGROUP);
+                }
+            }
+
+            // Redirect stdout and stderr to the log file
+            let log_path_c = CString::new(log_path.to_str().unwrap()).unwrap();
+            let log_fd = unsafe {
+                libc::open(
+                    log_path_c.as_ptr(),
+                    libc::O_CREAT | libc::O_WRONLY | libc::O_APPEND,
+                    0o644,
+                )
+            };
+            if log_fd >= 0 {
+                unsafe {
+                    libc::dup2(log_fd, libc::STDOUT_FILENO);
+                    libc::dup2(log_fd, libc::STDERR_FILENO);
+                    libc::close(log_fd);
+                }
+            }
+
+            // Redirect stdin from /dev/null
+            let null_c = CString::new("/dev/null").unwrap();
+            let null_fd = unsafe { libc::open(null_c.as_ptr(), libc::O_RDONLY) };
+            if null_fd >= 0 {
+                unsafe {
+                    libc::dup2(null_fd, libc::STDIN_FILENO);
+                    libc::close(null_fd);
+                }
+            }
+
+            if let Err(e) = setup_container_root(config) {
+                eprintln!("[Container Init Error] {}", e);
+                unsafe { libc::_exit(126) };
+            }
+
+            execute_payload(config);
+            unsafe { libc::_exit(127) };
+        }
+
+        // Supervisor: send container_pid to parent
+        unsafe {
+            let pid_i32 = container_pid as i32;
+            libc::write(
+                pid_pipe[1],
+                &pid_i32 as *const i32 as *const libc::c_void,
+                std::mem::size_of::<i32>(),
+            );
+            libc::close(pid_pipe[1]);
+        }
+
+        // Wait for container init process to finish
+        let mut status: i32 = 0;
+        unsafe {
+            libc::waitpid(container_pid, &mut status, 0);
+        }
+        let code = if libc::WIFEXITED(status) {
+            libc::WEXITSTATUS(status)
+        } else if libc::WIFSIGNALED(status) {
+            128 + libc::WTERMSIG(status)
+        } else {
+            1
+        };
+
+        let _ = fs::write(exit_file, format!("{}\n", code));
+        unsafe { libc::_exit(0) };
+    }
+
+    // --- Parent (Guest Agent) ---
+    unsafe {
+        libc::close(pid_pipe[1]);
+    }
+    let mut c_pid: i32 = 0;
+    let n = unsafe {
+        libc::read(
+            pid_pipe[0],
+            &mut c_pid as *mut i32 as *mut libc::c_void,
+            std::mem::size_of::<i32>(),
+        )
+    };
+    unsafe {
+        libc::close(pid_pipe[0]);
+    }
+
+    if n <= 0 || c_pid <= 0 {
+        return Err(MacletError::Guest(
+            "Failed to receive container PID from intermediate supervisor".to_string(),
+        ));
+    }
+
+    Ok((intermediate_pid as u32, c_pid as u32))
+}
+
+#[cfg(target_os = "linux")]
+fn exec_linux_namespaces(
+    container_pid: u32,
+    command: &str,
+    args: &[String],
+    env: &HashMap<String, String>,
+) -> Result<ExecutionResult> {
+    use std::io::Read;
+    use std::os::unix::io::FromRawFd;
+
+    let mut stdout_pipe = [0i32; 2];
+    let mut stderr_pipe = [0i32; 2];
+    unsafe {
+        if libc::pipe(stdout_pipe.as_mut_ptr()) != 0 || libc::pipe(stderr_pipe.as_mut_ptr()) != 0 {
+            return Err(MacletError::Io(std::io::Error::last_os_error()));
+        }
+    }
+
+    let helper_pid = unsafe { libc::fork() };
+    if helper_pid < 0 {
+        return Err(MacletError::Io(std::io::Error::last_os_error()));
+    }
+
+    if helper_pid == 0 {
+        // --- Helper Process: Join container namespaces ---
+        unsafe {
+            libc::close(stdout_pipe[0]);
+            libc::close(stderr_pipe[0]);
+        }
+
+        // Open container root directory before switching mount namespace
+        let root_path = format!("/proc/{}/root", container_pid);
+        let root_c = CString::new(root_path.as_str()).unwrap();
+        let root_fd = unsafe { libc::open(root_c.as_ptr(), libc::O_RDONLY) };
+
+        let ns_list = [
+            (format!("/proc/{}/ns/ipc", container_pid), libc::CLONE_NEWIPC),
+            (format!("/proc/{}/ns/uts", container_pid), libc::CLONE_NEWUTS),
+            (format!("/proc/{}/ns/cgroup", container_pid), libc::CLONE_NEWCGROUP),
+            (format!("/proc/{}/ns/pid", container_pid), libc::CLONE_NEWPID),
+            (format!("/proc/{}/ns/mnt", container_pid), libc::CLONE_NEWNS),
+        ];
+
+        for (path, nstype) in &ns_list {
+            let path_c = CString::new(path.as_str()).unwrap();
+            let fd = unsafe { libc::open(path_c.as_ptr(), libc::O_RDONLY) };
+            if fd >= 0 {
+                let ret = unsafe { libc::setns(fd, *nstype) };
+                unsafe { libc::close(fd) };
+                if ret != 0 {
+                    let err_msg = format!("Failed to setns {}: {}\n", path, std::io::Error::last_os_error());
+                    unsafe {
+                        libc::write(stderr_pipe[1], err_msg.as_ptr() as *const _, err_msg.len());
+                        libc::_exit(125);
+                    }
+                }
+            }
+        }
+
+        // Pivot/chroot into container root directory
+        if root_fd >= 0 {
+            unsafe {
+                libc::fchdir(root_fd);
+                libc::chroot(b".\0".as_ptr());
+                libc::close(root_fd);
+            }
+        }
+
+        // Fork the child that will actually execute within the container PID & Mount namespaces
+        let exec_child_pid = unsafe { libc::fork() };
+        if exec_child_pid < 0 {
+            unsafe { libc::_exit(125) };
+        }
+
+        if exec_child_pid == 0 {
+            // Inside the container!
+            unsafe {
+                libc::dup2(stdout_pipe[1], libc::STDOUT_FILENO);
+                libc::dup2(stderr_pipe[1], libc::STDERR_FILENO);
+                libc::close(stdout_pipe[1]);
+                libc::close(stderr_pipe[1]);
+                let slash_c = CString::new("/").unwrap();
+                libc::chdir(slash_c.as_ptr());
+            }
+
+            let cmd_cfg = ContainerConfig {
+                id: format!("exec-{}", container_pid),
+                hostname: String::new(),
+                rootfs: PathBuf::from("/"),
+                command: command.to_string(),
+                args: args.to_vec(),
+                env: env.clone(),
+                cgroup_path: None,
+            };
+            execute_payload(&cmd_cfg);
+            unsafe { libc::_exit(127) };
+        }
+
+        // Helper waits for exec_child
+        unsafe {
+            libc::close(stdout_pipe[1]);
+            libc::close(stderr_pipe[1]);
+        }
+        let mut status: i32 = 0;
+        unsafe {
+            libc::waitpid(exec_child_pid, &mut status, 0);
+        }
+        let code = if libc::WIFEXITED(status) {
+            libc::WEXITSTATUS(status)
+        } else if libc::WIFSIGNALED(status) {
+            128 + libc::WTERMSIG(status)
+        } else {
+            1
+        };
+        unsafe { libc::_exit(code) };
+    }
+
+    // Parent
+    unsafe {
+        libc::close(stdout_pipe[1]);
+        libc::close(stderr_pipe[1]);
+    }
+
+    let mut stdout_file = unsafe { std::fs::File::from_raw_fd(stdout_pipe[0]) };
+    let mut stderr_file = unsafe { std::fs::File::from_raw_fd(stderr_pipe[0]) };
+
+    let mut stdout_buf = Vec::new();
+    let mut stderr_buf = Vec::new();
+    let _ = stdout_file.read_to_end(&mut stdout_buf);
+    let _ = stderr_file.read_to_end(&mut stderr_buf);
+
+    let mut status: i32 = 0;
+    unsafe {
+        libc::waitpid(helper_pid, &mut status, 0);
+    }
+    let exit_code = if libc::WIFEXITED(status) {
+        libc::WEXITSTATUS(status)
+    } else if libc::WIFSIGNALED(status) {
+        128 + libc::WTERMSIG(status)
+    } else {
+        -1
+    };
+
+    Ok(ExecutionResult {
+        exit_code,
+        stdout: String::from_utf8_lossy(&stdout_buf).into_owned(),
+        stderr: String::from_utf8_lossy(&stderr_buf).into_owned(),
+    })
 }
 
 /// Sets up genuine Linux namespaces, mounts rootfs, pivot_root, procfs, devtmpfs,

@@ -33,20 +33,32 @@ enum Commands {
         action: MachineCommands,
     },
 
-    /// Execute a command inside the Linux guest environment
+    /// Execute a command in a running container or the Linux VM
     #[command(trailing_var_arg = true)]
     Exec {
-        /// Command to execute
-        command: String,
+        /// Target container ID (or command to execute in VM)
+        target: String,
+
+        /// Command to execute inside container (if target is container)
+        #[arg(allow_hyphen_values = true)]
+        command: Option<String>,
 
         /// Arguments for the command
         #[arg(allow_hyphen_values = true)]
         args: Vec<String>,
     },
 
-    /// Run an isolated Linux container with its own namespaces, rootfs, and pivot_root
+    /// Run an isolated Linux container with genuine namespaces, cgroups, and rootfs
     #[command(trailing_var_arg = true)]
     Run {
+        /// Run container in background and print container ID
+        #[arg(short = 'd', long = "detach")]
+        detach: bool,
+
+        /// Assign a name to the container
+        #[arg(long = "name")]
+        name: Option<String>,
+
         /// Container command to execute
         #[arg(default_value = "/bin/sh")]
         command: String,
@@ -76,10 +88,53 @@ enum Commands {
         stats: bool,
     },
 
-    /// Inspect live resource metrics of a container
+    /// List containers
+    Ps {
+        /// Show all containers (default shows just running)
+        #[arg(short = 'a', long = "all")]
+        all: bool,
+    },
+
+    /// Stop one or more running containers
+    Stop {
+        /// Container ID or name
+        id: String,
+
+        /// Seconds to wait before killing the container
+        #[arg(short = 't', long = "time", default_value_t = 10)]
+        time: u64,
+    },
+
+    /// Remove one or more containers
+    Rm {
+        /// Container ID or name
+        id: String,
+
+        /// Force removal of a running container
+        #[arg(short = 'f', long = "force")]
+        force: bool,
+    },
+
+    /// Fetch the logs of a container
+    Logs {
+        /// Container ID or name
+        id: String,
+
+        /// Number of lines to show from the end of the logs
+        #[arg(short = 'n', long = "tail")]
+        tail: Option<usize>,
+    },
+
+    /// Inspect details and configuration of a container
     Inspect {
         /// Container identifier
         id: String,
+    },
+
+    /// Display live resource usage statistics for containers
+    Stats {
+        /// Container identifier (optional; defaults to all running containers)
+        id: Option<String>,
     },
 
     /// Display version and environment information
@@ -386,7 +441,7 @@ async fn handle_status() -> Result<()> {
     Ok(())
 }
 
-async fn handle_stop() -> Result<()> {
+async fn handle_machine_stop() -> Result<()> {
     let sock_p = socket_path();
     if !sock_p.exists() {
         println!("{}", "Maclet VM is already stopped.".yellow());
@@ -414,7 +469,24 @@ async fn handle_stop() -> Result<()> {
     Ok(())
 }
 
-async fn handle_exec(command: String, args: Vec<String>) -> Result<i32> {
+fn format_relative_time(created_at: u64) -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(created_at);
+    let diff = now.saturating_sub(created_at);
+    if diff < 60 {
+        format!("{} seconds ago", diff)
+    } else if diff < 3600 {
+        format!("{} minutes ago", diff / 60)
+    } else if diff < 86400 {
+        format!("{} hours ago", diff / 3600)
+    } else {
+        format!("{} days ago", diff / 86400)
+    }
+}
+
+async fn handle_exec(target: String, command: Option<String>, args: Vec<String>) -> Result<i32> {
     let sock_p = socket_path();
     if !sock_p.exists() {
         return Err(anyhow!(
@@ -422,46 +494,92 @@ async fn handle_exec(command: String, args: Vec<String>) -> Result<i32> {
         ));
     }
 
-    let stream = UnixStream::connect(&sock_p).await
+    let stream = UnixStream::connect(&sock_p)
+        .await
         .context("Failed to connect to Maclet VM control socket")?;
 
     let (r, mut w) = stream.into_split();
     let mut buf_r = tokio::io::BufReader::new(r);
 
-    let req_id = format!("exec-{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_millis());
-    let req = HostMessage::Exec {
-        id: req_id.clone(),
-        command,
-        args,
-        env: HashMap::new(),
-        timeout_secs: 30,
-    };
-
-    write_async(&mut w, &req).await?;
-    let resp: Option<GuestMessage> = read_async(&mut buf_r).await?;
-
-    match resp {
-        Some(GuestMessage::ExecResult { id: _, exit_code, stdout, stderr }) => {
-            if !stdout.is_empty() {
-                print!("{}", stdout);
+    if let Some(cmd) = command {
+        let req = HostMessage::ExecInContainer {
+            id: target.clone(),
+            command: cmd,
+            args,
+            env: HashMap::new(),
+        };
+        write_async(&mut w, &req).await?;
+        let resp: Option<GuestMessage> = read_async(&mut buf_r).await?;
+        match resp {
+            Some(GuestMessage::ContainerExecResult {
+                exit_code,
+                stdout,
+                stderr,
+                ..
+            }) => {
+                if !stdout.is_empty() {
+                    print!("{}", stdout);
+                }
+                if !stderr.is_empty() {
+                    eprint!("{}", stderr);
+                }
+                Ok(exit_code)
             }
-            if !stderr.is_empty() {
-                eprint!("{}", stderr);
+            Some(GuestMessage::Error { message, .. }) => {
+                eprintln!("{}: {}", "Exec error".bold().red(), message);
+                Ok(1)
             }
-            Ok(exit_code)
+            other => {
+                eprintln!("Unexpected response from guest agent: {:?}", other);
+                Ok(1)
+            }
         }
-        Some(GuestMessage::Error { message, .. }) => {
-            eprintln!("Guest agent returned error: {}", message);
-            Ok(1)
-        }
-        other => {
-            eprintln!("Unexpected response from guest: {:?}", other);
-            Ok(1)
+    } else {
+        let req_id = format!(
+            "exec-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)?
+                .as_millis()
+        );
+        let req = HostMessage::Exec {
+            id: req_id,
+            command: target,
+            args,
+            env: HashMap::new(),
+            timeout_secs: 30,
+        };
+        write_async(&mut w, &req).await?;
+        let resp: Option<GuestMessage> = read_async(&mut buf_r).await?;
+        match resp {
+            Some(GuestMessage::ExecResult {
+                exit_code,
+                stdout,
+                stderr,
+                ..
+            }) => {
+                if !stdout.is_empty() {
+                    print!("{}", stdout);
+                }
+                if !stderr.is_empty() {
+                    eprint!("{}", stderr);
+                }
+                Ok(exit_code)
+            }
+            Some(GuestMessage::Error { message, .. }) => {
+                eprintln!("{}: {}", "Exec error".bold().red(), message);
+                Ok(1)
+            }
+            other => {
+                eprintln!("Unexpected response from guest: {:?}", other);
+                Ok(1)
+            }
         }
     }
 }
 
 async fn handle_run(
+    detach: bool,
+    name: Option<String>,
     command: String,
     args: Vec<String>,
     hostname: Option<String>,
@@ -502,14 +620,17 @@ async fn handle_run(
             .duration_since(std::time::UNIX_EPOCH)?
             .as_millis()
     );
+
     let req = HostMessage::RunContainer {
         id: cnt_id.clone(),
-        image: "alpine".to_string(),
+        name,
+        image: "alpine:latest".to_string(),
         command,
         args,
         env: HashMap::new(),
         hostname,
         limits: Some(limits),
+        detached: detach,
         timeout_secs: 60,
     };
 
@@ -517,6 +638,10 @@ async fn handle_run(
     let resp: Option<GuestMessage> = read_async(&mut buf_r).await?;
 
     match resp {
+        Some(GuestMessage::ContainerStarted { id, .. }) => {
+            println!("{}", id);
+            Ok(0)
+        }
         Some(GuestMessage::ContainerResult {
             id,
             exit_code,
@@ -563,11 +688,169 @@ async fn handle_run(
             Ok(exit_code)
         }
         Some(GuestMessage::Error { message, .. }) => {
-            eprintln!("Container execution error: {}", message);
+            eprintln!("{}: {}", "Container execution error".bold().red(), message);
             Ok(1)
         }
         other => {
             eprintln!("Unexpected response from guest agent: {:?}", other);
+            Ok(1)
+        }
+    }
+}
+
+async fn handle_ps(all: bool) -> Result<i32> {
+    let sock_p = socket_path();
+    if !sock_p.exists() {
+        return Err(anyhow!("Maclet VM is not running. Start with 'maclet machine start'."));
+    }
+
+    let stream = UnixStream::connect(&sock_p).await?;
+    let (r, mut w) = stream.into_split();
+    let mut buf_r = tokio::io::BufReader::new(r);
+
+    let req = HostMessage::ListContainers { all };
+    write_async(&mut w, &req).await?;
+
+    let resp: Option<GuestMessage> = read_async(&mut buf_r).await?;
+    match resp {
+        Some(GuestMessage::ContainerList { containers }) => {
+            println!(
+                "{:<16} {:<16} {:<24} {:<18} {:<16} {:<16}",
+                "CONTAINER ID", "IMAGE", "COMMAND", "CREATED", "STATUS", "NAMES"
+            );
+            for c in containers {
+                let id_short = if c.id.len() > 12 { &c.id[..12] } else { &c.id };
+                let cmd_short = if c.command.len() > 22 {
+                    format!("\"{}...\"", &c.command[..19])
+                } else {
+                    format!("\"{}\"", c.command)
+                };
+                let status_str = match c.status {
+                    maclet_common::ContainerStatus::Running => "Up".green().to_string(),
+                    maclet_common::ContainerStatus::Exited => {
+                        let code = c.exit_code.unwrap_or(0);
+                        if code == 0 {
+                            format!("Exited ({})", code).cyan().to_string()
+                        } else {
+                            format!("Exited ({})", code).red().to_string()
+                        }
+                    }
+                    maclet_common::ContainerStatus::Stopped => "Stopped".yellow().to_string(),
+                    maclet_common::ContainerStatus::Created => "Created".normal().to_string(),
+                };
+                let rel_time = format_relative_time(c.created_at);
+                println!(
+                    "{:<16} {:<16} {:<24} {:<18} {:<16} {:<16}",
+                    id_short, c.image, cmd_short, rel_time, status_str, c.name
+                );
+            }
+            Ok(0)
+        }
+        Some(GuestMessage::Error { message, .. }) => {
+            eprintln!("{}: {}", "Error".bold().red(), message);
+            Ok(1)
+        }
+        _ => {
+            eprintln!("Failed to get container list");
+            Ok(1)
+        }
+    }
+}
+
+async fn handle_stop_container(id: String, time: u64) -> Result<i32> {
+    let sock_p = socket_path();
+    if !sock_p.exists() {
+        return Err(anyhow!("Maclet VM is not running."));
+    }
+
+    let stream = UnixStream::connect(&sock_p).await?;
+    let (r, mut w) = stream.into_split();
+    let mut buf_r = tokio::io::BufReader::new(r);
+
+    let req = HostMessage::StopContainer {
+        id: id.clone(),
+        timeout_secs: time,
+    };
+    write_async(&mut w, &req).await?;
+
+    let resp: Option<GuestMessage> = read_async(&mut buf_r).await?;
+    match resp {
+        Some(GuestMessage::ContainerStopped { id, .. }) => {
+            println!("{}", id);
+            Ok(0)
+        }
+        Some(GuestMessage::Error { message, .. }) => {
+            eprintln!("{}: {}", "Stop error".bold().red(), message);
+            Ok(1)
+        }
+        _ => {
+            eprintln!("Failed to stop container");
+            Ok(1)
+        }
+    }
+}
+
+async fn handle_rm(id: String, force: bool) -> Result<i32> {
+    let sock_p = socket_path();
+    if !sock_p.exists() {
+        return Err(anyhow!("Maclet VM is not running."));
+    }
+
+    let stream = UnixStream::connect(&sock_p).await?;
+    let (r, mut w) = stream.into_split();
+    let mut buf_r = tokio::io::BufReader::new(r);
+
+    let req = HostMessage::RemoveContainer {
+        id: id.clone(),
+        force,
+    };
+    write_async(&mut w, &req).await?;
+
+    let resp: Option<GuestMessage> = read_async(&mut buf_r).await?;
+    match resp {
+        Some(GuestMessage::ContainerRemoved { id }) => {
+            println!("{}", id);
+            Ok(0)
+        }
+        Some(GuestMessage::Error { message, .. }) => {
+            eprintln!("{}: {}", "Remove error".bold().red(), message);
+            Ok(1)
+        }
+        _ => {
+            eprintln!("Failed to remove container");
+            Ok(1)
+        }
+    }
+}
+
+async fn handle_logs(id: String, tail: Option<usize>) -> Result<i32> {
+    let sock_p = socket_path();
+    if !sock_p.exists() {
+        return Err(anyhow!("Maclet VM is not running."));
+    }
+
+    let stream = UnixStream::connect(&sock_p).await?;
+    let (r, mut w) = stream.into_split();
+    let mut buf_r = tokio::io::BufReader::new(r);
+
+    let req = HostMessage::ContainerLogs {
+        id: id.clone(),
+        tail,
+    };
+    write_async(&mut w, &req).await?;
+
+    let resp: Option<GuestMessage> = read_async(&mut buf_r).await?;
+    match resp {
+        Some(GuestMessage::ContainerLogsResult { logs, .. }) => {
+            print!("{}", logs);
+            Ok(0)
+        }
+        Some(GuestMessage::Error { message, .. }) => {
+            eprintln!("{}: {}", "Logs error".bold().red(), message);
+            Ok(1)
+        }
+        _ => {
+            eprintln!("Failed to retrieve logs");
             Ok(1)
         }
     }
@@ -588,30 +871,103 @@ async fn handle_inspect(id: String) -> Result<i32> {
 
     let resp: Option<GuestMessage> = read_async(&mut buf_r).await?;
     match resp {
-        Some(GuestMessage::InspectResult { id, state, metrics }) => {
-            println!(
-                "{}",
-                format!("=== Container Inspection: {} ===", id).bold().cyan()
-            );
-            println!("State: {}", state.green());
-            println!(
-                "Memory: {:.2} MB",
-                metrics.memory_current as f64 / (1024.0 * 1024.0)
-            );
-            println!(
-                "CPU Usage: {:.3}s",
-                metrics.cpu_usage_usec as f64 / 1_000_000.0
-            );
-            println!("PIDs: {}", metrics.pids_current);
+        Some(GuestMessage::InspectResult { details, .. }) => {
+            println!("{}", serde_json::to_string_pretty(&details)?);
             Ok(0)
         }
         Some(GuestMessage::Error { message, .. }) => {
-            eprintln!("Inspect error: {}", message);
+            eprintln!("{}: {}", "Inspect error".bold().red(), message);
             Ok(1)
         }
         _ => {
             eprintln!("No inspection data received");
             Ok(1)
+        }
+    }
+}
+
+async fn handle_stats(id: Option<String>) -> Result<i32> {
+    let sock_p = socket_path();
+    if !sock_p.exists() {
+        return Err(anyhow!("Maclet VM is not running."));
+    }
+
+    let stream = UnixStream::connect(&sock_p).await?;
+    let (r, mut w) = stream.into_split();
+    let mut buf_r = tokio::io::BufReader::new(r);
+
+    if let Some(target_id) = id {
+        let req = HostMessage::InspectContainer {
+            id: target_id.clone(),
+        };
+        write_async(&mut w, &req).await?;
+        let resp: Option<GuestMessage> = read_async(&mut buf_r).await?;
+        match resp {
+            Some(GuestMessage::InspectResult { details, .. }) => {
+                println!(
+                    "{:<16} {:<16} {:<12} {:<24} {:<10}",
+                    "CONTAINER ID", "NAME", "CPU %", "MEM USAGE / LIMIT", "PIDS"
+                );
+                let id_short = if details.id.len() > 12 {
+                    &details.id[..12]
+                } else {
+                    &details.id
+                };
+                let (mem_str, pids_str) = if let Some(m) = details.metrics {
+                    let mem_used_mb = m.memory_current as f64 / (1024.0 * 1024.0);
+                    let mem_max_str = m
+                        .memory_max
+                        .map(|b| format!("{:.1}MB", b as f64 / (1024.0 * 1024.0)))
+                        .unwrap_or_else(|| "unlimited".to_string());
+                    (
+                        format!("{:.2}MB / {}", mem_used_mb, mem_max_str),
+                        m.pids_current.to_string(),
+                    )
+                } else {
+                    ("-- / --".to_string(), "--".to_string())
+                };
+                println!(
+                    "{:<16} {:<16} {:<12} {:<24} {:<10}",
+                    id_short, details.name, "0.00%", mem_str, pids_str
+                );
+                Ok(0)
+            }
+            Some(GuestMessage::Error { message, .. }) => {
+                eprintln!("{}: {}", "Stats error".bold().red(), message);
+                Ok(1)
+            }
+            _ => Ok(1),
+        }
+    } else {
+        let req = HostMessage::ListContainers { all: false };
+        write_async(&mut w, &req).await?;
+        let resp: Option<GuestMessage> = read_async(&mut buf_r).await?;
+        match resp {
+            Some(GuestMessage::ContainerList { containers }) => {
+                println!(
+                    "{:<16} {:<16} {:<12} {:<24} {:<10}",
+                    "CONTAINER ID", "NAME", "CPU %", "MEM USAGE / LIMIT", "PIDS"
+                );
+                for c in containers {
+                    let id_short = if c.id.len() > 12 { &c.id[..12] } else { &c.id };
+                    let mem_used = c.memory_current.unwrap_or(0) as f64 / (1024.0 * 1024.0);
+                    let mem_max_str = c
+                        .memory_max
+                        .map(|b| format!("{:.1}MB", b as f64 / (1024.0 * 1024.0)))
+                        .unwrap_or_else(|| "unlimited".to_string());
+                    let mem_str = format!("{:.2}MB / {}", mem_used, mem_max_str);
+                    println!(
+                        "{:<16} {:<16} {:<12} {:<24} {:<10}",
+                        id_short,
+                        c.name,
+                        "0.00%",
+                        mem_str,
+                        c.pid.map(|_| "1").unwrap_or("0")
+                    );
+                }
+                Ok(0)
+            }
+            _ => Ok(1),
         }
     }
 }
@@ -638,11 +994,17 @@ async fn main() -> ExitCode {
         Commands::Machine { action } => match action {
             MachineCommands::Init { cpus, memory } => handle_init(cpus, memory).await.map(|_| 0),
             MachineCommands::Start { daemon } => handle_start(daemon).await.map(|_| 0),
-            MachineCommands::Stop => handle_stop().await.map(|_| 0),
+            MachineCommands::Stop => handle_machine_stop().await.map(|_| 0),
             MachineCommands::Status => handle_status().await.map(|_| 0),
         },
-        Commands::Exec { command, args } => handle_exec(command, args).await,
+        Commands::Exec {
+            target,
+            command,
+            args,
+        } => handle_exec(target, command, args).await,
         Commands::Run {
+            detach,
+            name,
             command,
             args,
             hostname,
@@ -650,8 +1012,18 @@ async fn main() -> ExitCode {
             cpus,
             pids_limit,
             stats,
-        } => handle_run(command, args, hostname, memory, cpus, pids_limit, stats).await,
+        } => {
+            handle_run(
+                detach, name, command, args, hostname, memory, cpus, pids_limit, stats,
+            )
+            .await
+        }
+        Commands::Ps { all } => handle_ps(all).await,
+        Commands::Stop { id, time } => handle_stop_container(id, time).await,
+        Commands::Rm { id, force } => handle_rm(id, force).await,
+        Commands::Logs { id, tail } => handle_logs(id, tail).await,
         Commands::Inspect { id } => handle_inspect(id).await,
+        Commands::Stats { id } => handle_stats(id).await,
         Commands::Version => {
             handle_version();
             Ok(0)

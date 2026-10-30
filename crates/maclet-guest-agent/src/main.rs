@@ -1,11 +1,14 @@
 use flate2::read::GzDecoder;
-use maclet_common::{GuestMessage, HostMessage, ResourceLimits, Result};
+use maclet_common::{
+    ContainerInfo, ContainerInspectDetails, ContainerStatus, GuestMessage, HostMessage,
+    ResourceLimits, Result,
+};
 use maclet_container::Container;
 use maclet_ipc::{read_sync, write_sync};
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufReader, BufWriter};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::thread::sleep;
 use std::time::{Duration, Instant};
@@ -385,35 +388,144 @@ fn handle_exec(
     }
 }
 
+fn current_timestamp() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or_else(|_| get_uptime_secs())
+}
+
+fn is_pid_alive(pid: u32) -> bool {
+    if pid == 0 {
+        return false;
+    }
+    #[cfg(target_os = "linux")]
+    unsafe {
+        libc::kill(pid as i32, 0) == 0
+    }
+    #[cfg(not(target_os = "linux"))]
+    false
+}
+
 fn handle_run_container(
     id: String,
+    name: Option<String>,
+    image: String,
     command: String,
     args: Vec<String>,
     env: HashMap<String, String>,
     hostname: Option<String>,
     limits: Option<ResourceLimits>,
+    detached: bool,
 ) -> GuestMessage {
     let base_rootfs = Path::new("/var/lib/maclet/rootfs");
-    match Container::new(id.clone(), base_rootfs, command, args, env, hostname, limits) {
+    let container_name = name.unwrap_or_else(|| {
+        let short = if id.len() > 12 { &id[..12] } else { &id };
+        format!("cnt-{}", short)
+    });
+
+    match Container::new(
+        id.clone(),
+        base_rootfs,
+        command.clone(),
+        args.clone(),
+        env.clone(),
+        hostname.clone(),
+        limits.clone(),
+    ) {
         Ok(container) => {
-            let res = match container.run() {
-                Ok((exec_res, metrics)) => GuestMessage::ContainerResult {
-                    id: id.clone(),
-                    exit_code: exec_res.exit_code,
-                    stdout: exec_res.stdout,
-                    stderr: exec_res.stderr,
-                    metrics,
+            let container_dir = PathBuf::from(format!("/var/lib/maclet/containers/{}", id));
+            let _ = fs::create_dir_all(&container_dir);
+            let _ = fs::create_dir_all("/var/log/maclet");
+
+            let log_path = PathBuf::from(format!("/var/log/maclet/{}.log", id));
+            let exit_file = container_dir.join("exit_code");
+
+            let now = current_timestamp();
+            let mut details = ContainerInspectDetails {
+                id: id.clone(),
+                name: container_name.clone(),
+                image: if image.is_empty() {
+                    "alpine:latest".to_string()
+                } else {
+                    image
                 },
-                Err(e) => GuestMessage::ContainerResult {
-                    id: id.clone(),
-                    exit_code: 126,
-                    stdout: String::new(),
-                    stderr: format!("Failed to run container: {}\n", e),
-                    metrics: None,
-                },
+                command: command.clone(),
+                args: args.clone(),
+                env: env.clone(),
+                hostname: container.hostname.clone(),
+                status: ContainerStatus::Created,
+                created_at: now,
+                started_at: None,
+                finished_at: None,
+                pid: None,
+                exit_code: None,
+                limits: limits.clone(),
+                metrics: None,
+                rootfs_path: container.rootfs.to_string_lossy().to_string(),
+                log_path: log_path.to_string_lossy().to_string(),
             };
-            container.cleanup();
-            res
+
+            if detached {
+                match container.spawn_detached(&log_path, &exit_file) {
+                    Ok((sup_pid, c_pid)) => {
+                        let _ = fs::write(container_dir.join("supervisor.pid"), format!("{}\n", sup_pid));
+                        let _ = fs::write(container_dir.join("pid"), format!("{}\n", c_pid));
+
+                        details.status = ContainerStatus::Running;
+                        details.started_at = Some(now);
+                        details.pid = Some(c_pid);
+
+                        let meta_path = container_dir.join("meta.json");
+                        let _ = fs::write(
+                            meta_path,
+                            serde_json::to_string_pretty(&details).unwrap_or_default(),
+                        );
+
+                        GuestMessage::ContainerStarted {
+                            id,
+                            pid: c_pid,
+                            name: container_name,
+                        }
+                    }
+                    Err(e) => {
+                        container.cleanup();
+                        GuestMessage::Error {
+                            id: Some(id),
+                            message: format!("Failed to spawn detached container: {}", e),
+                        }
+                    }
+                }
+            } else {
+                details.status = ContainerStatus::Running;
+                details.started_at = Some(now);
+
+                let res = match container.run() {
+                    Ok((exec_res, metrics)) => {
+                        details.status = ContainerStatus::Exited;
+                        details.finished_at = Some(current_timestamp());
+                        details.exit_code = Some(exec_res.exit_code);
+                        details.metrics = metrics.clone();
+
+                        GuestMessage::ContainerResult {
+                            id: id.clone(),
+                            exit_code: exec_res.exit_code,
+                            stdout: exec_res.stdout,
+                            stderr: exec_res.stderr,
+                            metrics,
+                        }
+                    }
+                    Err(e) => GuestMessage::ContainerResult {
+                        id: id.clone(),
+                        exit_code: 126,
+                        stdout: String::new(),
+                        stderr: format!("Failed to run container: {}\n", e),
+                        metrics: None,
+                    },
+                };
+                container.cleanup();
+                res
+            }
         }
         Err(e) => GuestMessage::ContainerResult {
             id,
@@ -422,6 +534,314 @@ fn handle_run_container(
             stderr: format!("Failed to initialize container: {}\n", e),
             metrics: None,
         },
+    }
+}
+
+fn handle_list_containers(
+    all: bool,
+    cgroup_mgr: &maclet_cgroups::CgroupV2Manager,
+) -> GuestMessage {
+    let containers_dir = Path::new("/var/lib/maclet/containers");
+    let mut list = Vec::new();
+
+    if let Ok(entries) = fs::read_dir(containers_dir) {
+        for entry in entries.flatten() {
+            let meta_path = entry.path().join("meta.json");
+            if let Ok(meta_str) = fs::read_to_string(&meta_path) {
+                if let Ok(mut details) = serde_json::from_str::<ContainerInspectDetails>(&meta_str) {
+                    let pid_file = entry.path().join("pid");
+                    let pid = fs::read_to_string(pid_file)
+                        .ok()
+                        .and_then(|s| s.trim().parse::<u32>().ok())
+                        .or(details.pid);
+
+                    if let Some(p) = pid {
+                        if is_pid_alive(p) {
+                            details.status = ContainerStatus::Running;
+                        } else {
+                            let exit_file = entry.path().join("exit_code");
+                            if let Ok(code_str) = fs::read_to_string(exit_file) {
+                                if let Ok(code) = code_str.trim().parse::<i32>() {
+                                    details.exit_code = Some(code);
+                                }
+                            }
+                            if details.status == ContainerStatus::Running {
+                                details.status = ContainerStatus::Exited;
+                            }
+                        }
+                    }
+
+                    if !all && details.status != ContainerStatus::Running {
+                        continue;
+                    }
+
+                    let metrics = cgroup_mgr.read_metrics(&details.id).ok();
+                    let mem_cur = metrics.as_ref().map(|m| m.memory_current);
+                    let mem_max = metrics.as_ref().and_then(|m| m.memory_max);
+
+                    let cmd_display = if details.args.is_empty() {
+                        details.command.clone()
+                    } else {
+                        format!("{} {}", details.command, details.args.join(" "))
+                    };
+
+                    list.push(ContainerInfo {
+                        id: details.id,
+                        name: details.name,
+                        image: details.image,
+                        command: cmd_display,
+                        status: details.status,
+                        created_at: details.created_at,
+                        pid,
+                        exit_code: details.exit_code,
+                        memory_current: mem_cur,
+                        memory_max: mem_max,
+                    });
+                }
+            }
+        }
+    }
+
+    list.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+    GuestMessage::ContainerList { containers: list }
+}
+
+fn handle_stop_container(id: String, timeout_secs: u64) -> GuestMessage {
+    let container_dir = PathBuf::from(format!("/var/lib/maclet/containers/{}", id));
+    if !container_dir.exists() {
+        return GuestMessage::Error {
+            id: Some(id),
+            message: "No such container".to_string(),
+        };
+    }
+
+    let pid_file = container_dir.join("pid");
+    let pid = fs::read_to_string(&pid_file)
+        .ok()
+        .and_then(|s| s.trim().parse::<u32>().ok());
+
+    let mut exit_code = None;
+
+    if let Some(p) = pid {
+        if is_pid_alive(p) {
+            #[cfg(target_os = "linux")]
+            unsafe {
+                libc::kill(p as i32, libc::SIGTERM);
+            }
+
+            // Wait up to timeout_secs
+            let iters = timeout_secs * 10;
+            let mut stopped = false;
+            for _ in 0..iters {
+                sleep(Duration::from_millis(100));
+                if !is_pid_alive(p) {
+                    stopped = true;
+                    break;
+                }
+            }
+
+            if !stopped {
+                #[cfg(target_os = "linux")]
+                unsafe {
+                    libc::kill(p as i32, libc::SIGKILL);
+                }
+                sleep(Duration::from_millis(100));
+            }
+        }
+    }
+
+    let exit_file = container_dir.join("exit_code");
+    if let Ok(s) = fs::read_to_string(&exit_file) {
+        if let Ok(c) = s.trim().parse::<i32>() {
+            exit_code = Some(c);
+        }
+    }
+
+    // Update meta.json
+    let meta_path = container_dir.join("meta.json");
+    if let Ok(meta_str) = fs::read_to_string(&meta_path) {
+        if let Ok(mut details) = serde_json::from_str::<ContainerInspectDetails>(&meta_str) {
+            details.status = ContainerStatus::Stopped;
+            details.finished_at = Some(current_timestamp());
+            details.exit_code = exit_code;
+            let _ = fs::write(meta_path, serde_json::to_string_pretty(&details).unwrap_or_default());
+        }
+    }
+
+    GuestMessage::ContainerStopped { id, exit_code }
+}
+
+fn handle_remove_container(
+    id: String,
+    force: bool,
+    cgroup_mgr: &maclet_cgroups::CgroupV2Manager,
+) -> GuestMessage {
+    let container_dir = PathBuf::from(format!("/var/lib/maclet/containers/{}", id));
+    if !container_dir.exists() {
+        return GuestMessage::Error {
+            id: Some(id.clone()),
+            message: format!("No such container: {}", id),
+        };
+    }
+
+    let pid_file = container_dir.join("pid");
+    let pid = fs::read_to_string(&pid_file)
+        .ok()
+        .and_then(|s| s.trim().parse::<u32>().ok());
+
+    if let Some(p) = pid {
+        if is_pid_alive(p) {
+            if !force {
+                return GuestMessage::Error {
+                    id: Some(id),
+                    message: "Container is running. Stop container first or use --force.".to_string(),
+                };
+            }
+            #[cfg(target_os = "linux")]
+            unsafe {
+                libc::kill(p as i32, libc::SIGKILL);
+            }
+            sleep(Duration::from_millis(100));
+        }
+    }
+
+    // Unmount rootfs
+    #[cfg(target_os = "linux")]
+    {
+        let rootfs_dir = container_dir.join("rootfs");
+        if let Ok(dst_c) = std::ffi::CString::new(rootfs_dir.to_str().unwrap()) {
+            unsafe {
+                libc::umount2(dst_c.as_ptr(), libc::MNT_DETACH);
+            }
+        }
+    }
+
+    // Clean up cgroup
+    cgroup_mgr.destroy_container_cgroup(&id);
+
+    // Remove directories and logs
+    let _ = fs::remove_dir_all(&container_dir);
+    let log_path = format!("/var/log/maclet/{}.log", id);
+    let _ = fs::remove_file(log_path);
+
+    GuestMessage::ContainerRemoved { id }
+}
+
+fn handle_container_logs(id: String, tail: Option<usize>) -> GuestMessage {
+    let log_path = format!("/var/log/maclet/{}.log", id);
+    match fs::read_to_string(&log_path) {
+        Ok(content) => {
+            let logs = if let Some(n) = tail {
+                let lines: Vec<&str> = content.lines().collect();
+                if lines.len() > n {
+                    lines[lines.len() - n..].join("\n") + "\n"
+                } else {
+                    content
+                }
+            } else {
+                content
+            };
+            GuestMessage::ContainerLogsResult { id, logs }
+        }
+        Err(_) => GuestMessage::ContainerLogsResult {
+            id,
+            logs: String::new(),
+        },
+    }
+}
+
+fn handle_exec_in_container(
+    id: String,
+    command: String,
+    args: Vec<String>,
+    env: HashMap<String, String>,
+) -> GuestMessage {
+    let container_dir = PathBuf::from(format!("/var/lib/maclet/containers/{}", id));
+    if !container_dir.exists() {
+        return GuestMessage::Error {
+            id: Some(id.clone()),
+            message: format!("No such container: {}", id),
+        };
+    }
+
+    let pid_file = container_dir.join("pid");
+    let pid = match fs::read_to_string(&pid_file)
+        .ok()
+        .and_then(|s| s.trim().parse::<u32>().ok())
+    {
+        Some(p) => p,
+        None => {
+            return GuestMessage::Error {
+                id: Some(id),
+                message: "Container PID not found".to_string(),
+            };
+        }
+    };
+
+    if !is_pid_alive(pid) {
+        return GuestMessage::Error {
+            id: Some(id),
+            message: "Container is not running".to_string(),
+        };
+    }
+
+    match maclet_namespaces::exec_in_existing_container(pid, &command, &args, &env) {
+        Ok(res) => GuestMessage::ContainerExecResult {
+            id,
+            exit_code: res.exit_code,
+            stdout: res.stdout,
+            stderr: res.stderr,
+        },
+        Err(e) => GuestMessage::Error {
+            id: Some(id),
+            message: format!("Exec failed: {}", e),
+        },
+    }
+}
+
+fn handle_inspect_container(
+    id: String,
+    cgroup_mgr: &maclet_cgroups::CgroupV2Manager,
+) -> GuestMessage {
+    let container_dir = PathBuf::from(format!("/var/lib/maclet/containers/{}", id));
+    let meta_path = container_dir.join("meta.json");
+
+    if let Ok(meta_str) = fs::read_to_string(&meta_path) {
+        if let Ok(mut details) = serde_json::from_str::<ContainerInspectDetails>(&meta_str) {
+            let pid_file = container_dir.join("pid");
+            let pid = fs::read_to_string(pid_file)
+                .ok()
+                .and_then(|s| s.trim().parse::<u32>().ok())
+                .or(details.pid);
+
+            if let Some(p) = pid {
+                if is_pid_alive(p) {
+                    details.status = ContainerStatus::Running;
+                } else {
+                    let exit_file = container_dir.join("exit_code");
+                    if let Ok(code_str) = fs::read_to_string(exit_file) {
+                        if let Ok(code) = code_str.trim().parse::<i32>() {
+                            details.exit_code = Some(code);
+                        }
+                    }
+                    if details.status == ContainerStatus::Running {
+                        details.status = ContainerStatus::Exited;
+                    }
+                }
+            }
+
+            details.metrics = cgroup_mgr.read_metrics(&id).ok();
+
+            return GuestMessage::InspectResult {
+                id,
+                details: Box::new(details),
+            };
+        }
+    }
+
+    GuestMessage::Error {
+        id: Some(id.clone()),
+        message: format!("Container '{}' not found", id),
     }
 }
 
@@ -439,6 +859,8 @@ fn run_agent() -> Result<()> {
     let _ = cgroup_mgr.init();
 
     ensure_base_rootfs();
+    let _ = fs::create_dir_all("/var/lib/maclet/containers");
+    let _ = fs::create_dir_all("/var/log/maclet");
 
     let file = open_channel()?;
     let mut reader = BufReader::new(file.try_clone()?);
@@ -470,27 +892,57 @@ fn run_agent() -> Result<()> {
             }
             HostMessage::RunContainer {
                 id,
-                image: _,
+                name,
+                image,
                 command,
                 args,
                 env,
                 hostname,
                 limits,
+                detached,
                 timeout_secs: _,
             } => {
-                let result = handle_run_container(id, command, args, env, hostname, limits);
+                let result = handle_run_container(
+                    id,
+                    name,
+                    image,
+                    command,
+                    args,
+                    env,
+                    hostname,
+                    limits,
+                    detached,
+                );
+                write_sync(&mut writer, &result)?;
+            }
+            HostMessage::ListContainers { all } => {
+                let result = handle_list_containers(all, &cgroup_mgr);
+                write_sync(&mut writer, &result)?;
+            }
+            HostMessage::StopContainer { id, timeout_secs } => {
+                let result = handle_stop_container(id, timeout_secs);
+                write_sync(&mut writer, &result)?;
+            }
+            HostMessage::RemoveContainer { id, force } => {
+                let result = handle_remove_container(id, force, &cgroup_mgr);
+                write_sync(&mut writer, &result)?;
+            }
+            HostMessage::ContainerLogs { id, tail } => {
+                let result = handle_container_logs(id, tail);
+                write_sync(&mut writer, &result)?;
+            }
+            HostMessage::ExecInContainer {
+                id,
+                command,
+                args,
+                env,
+            } => {
+                let result = handle_exec_in_container(id, command, args, env);
                 write_sync(&mut writer, &result)?;
             }
             HostMessage::InspectContainer { id } => {
-                let metrics = cgroup_mgr.read_metrics(&id).unwrap_or_default();
-                write_sync(
-                    &mut writer,
-                    &GuestMessage::InspectResult {
-                        id,
-                        state: "active".to_string(),
-                        metrics,
-                    },
-                )?;
+                let result = handle_inspect_container(id, &cgroup_mgr);
+                write_sync(&mut writer, &result)?;
             }
             HostMessage::Shutdown { id } => {
                 let _ = write_sync(&mut writer, &GuestMessage::Pong { id });

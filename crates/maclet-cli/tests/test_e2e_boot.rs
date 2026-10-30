@@ -74,6 +74,7 @@ async fn test_vm_boot_and_handshake_and_exec() {
         &mut guest_writer,
         &HostMessage::RunContainer {
             id: "e2e-cnt".to_string(),
+            name: None,
             image: "alpine".to_string(),
             command: "/bin/sh".to_string(),
             args: vec![
@@ -83,6 +84,7 @@ async fn test_vm_boot_and_handshake_and_exec() {
             env: HashMap::new(),
             hostname: Some("test-e2e-box".to_string()),
             limits: None,
+            detached: false,
             timeout_secs: 20,
         },
     )
@@ -107,6 +109,7 @@ async fn test_vm_boot_and_handshake_and_exec() {
         &mut guest_writer,
         &HostMessage::RunContainer {
             id: "e2e-cgroup".to_string(),
+            name: None,
             image: "alpine".to_string(),
             command: "/bin/sh".to_string(),
             args: vec![
@@ -121,6 +124,7 @@ async fn test_vm_boot_and_handshake_and_exec() {
                     .with_cpus(1.0)
                     .with_pids(50),
             ),
+            detached: false,
             timeout_secs: 20,
         },
     )
@@ -138,6 +142,84 @@ async fn test_vm_boot_and_handshake_and_exec() {
     } else {
         panic!("Expected ContainerResult, got {:?}", cg_res);
     }
+
+    // Phase 4: Lifecycle - Detached run, exec inside container, inspect, stop, and remove
+    write_async(
+        &mut guest_writer,
+        &HostMessage::RunContainer {
+            id: "e2e-detached".to_string(),
+            name: Some("test-worker".to_string()),
+            image: "alpine".to_string(),
+            command: "/bin/sh".to_string(),
+            args: vec!["-c".to_string(), "sleep 60".to_string()],
+            env: HashMap::new(),
+            hostname: Some("worker-host".to_string()),
+            limits: None,
+            detached: true,
+            timeout_secs: 10,
+        },
+    )
+    .await
+    .unwrap();
+
+    let start_res: Option<GuestMessage> = read_async(&mut guest_buf_reader).await.unwrap();
+    match start_res {
+        Some(GuestMessage::ContainerStarted { id, name, .. }) => {
+            assert_eq!(id, "e2e-detached");
+            assert_eq!(name, "test-worker");
+        }
+        other => panic!("Expected ContainerStarted, got {:?}", other),
+    }
+
+    // Exec inside running container
+    write_async(
+        &mut guest_writer,
+        &HostMessage::ExecInContainer {
+            id: "e2e-detached".to_string(),
+            command: "/bin/sh".to_string(),
+            args: vec!["-c".to_string(), "echo exec-e2e-ok".to_string()],
+            env: HashMap::new(),
+        },
+    )
+    .await
+    .unwrap();
+
+    let exec_res: Option<GuestMessage> = read_async(&mut guest_buf_reader).await.unwrap();
+    match exec_res {
+        Some(GuestMessage::ContainerExecResult { exit_code, stdout, .. }) => {
+            assert_eq!(exit_code, 0);
+            assert!(stdout.contains("exec-e2e-ok"));
+        }
+        other => panic!("Expected ContainerExecResult, got {:?}", other),
+    }
+
+    // Stop container
+    write_async(
+        &mut guest_writer,
+        &HostMessage::StopContainer {
+            id: "e2e-detached".to_string(),
+            timeout_secs: 2,
+        },
+    )
+    .await
+    .unwrap();
+
+    let stop_res: Option<GuestMessage> = read_async(&mut guest_buf_reader).await.unwrap();
+    assert!(matches!(stop_res, Some(GuestMessage::ContainerStopped { id, .. }) if id == "e2e-detached"));
+
+    // Remove container
+    write_async(
+        &mut guest_writer,
+        &HostMessage::RemoveContainer {
+            id: "e2e-detached".to_string(),
+            force: false,
+        },
+    )
+    .await
+    .unwrap();
+
+    let rm_res: Option<GuestMessage> = read_async(&mut guest_buf_reader).await.unwrap();
+    assert!(matches!(rm_res, Some(GuestMessage::ContainerRemoved { id }) if id == "e2e-detached"));
 
     // Graceful stop
     vm.stop().expect("Failed to stop VM");
