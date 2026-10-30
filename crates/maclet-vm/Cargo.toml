@@ -1,0 +1,15 @@
+[package]
+name = "maclet-vm"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+maclet-common = { path = "../maclet-common" }
+maclet-ipc = { path = "../maclet-ipc" }
+tokio = { version = "1.38", features = ["net", "io-util", "sync"] }
+tracing = "0.1"
+
+[build-dependencies]
+cc = "1.0"

@@ -1,0 +1,74 @@
+use maclet_common::{GuestMessage, HostMessage, VmConfig};
+use maclet_ipc::{read_async, write_async};
+use maclet_vm::VirtualMachine;
+use std::collections::HashMap;
+use std::path::PathBuf;
+
+fn dirs_home() -> PathBuf {
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/tmp"))
+}
+
+#[tokio::test]
+async fn test_vm_boot_and_handshake_and_exec() {
+    let kernel_path = dirs_home().join(".maclet/kernel/Image");
+    let initramfs_path = dirs_home().join(".maclet/kernel/initrd.img");
+
+    if !kernel_path.exists() || !initramfs_path.exists() {
+        eprintln!("Kernel or initramfs not initialized, skipping e2e boot test");
+        return;
+    }
+
+    let config = VmConfig {
+        cpu_count: 2,
+        memory_mb: 512,
+        kernel_path,
+        initramfs_path,
+        cmdline: "console=hvc0 rdinit=/init quiet".to_string(),
+    };
+
+    let (mut vm, guest_channel) = VirtualMachine::start(&config, None)
+        .expect("Failed to boot virtual machine");
+
+    let (guest_reader, mut guest_writer) = guest_channel.into_split();
+    let mut guest_buf_reader = tokio::io::BufReader::new(guest_reader);
+
+    // Expect Ready
+    let ready: Option<GuestMessage> = read_async(&mut guest_buf_reader).await.unwrap();
+    assert!(matches!(ready, Some(GuestMessage::Ready { .. })));
+
+    // Ping / Pong
+    write_async(&mut guest_writer, &HostMessage::Ping { id: "test-ping".to_string() })
+        .await
+        .unwrap();
+    let pong: Option<GuestMessage> = read_async(&mut guest_buf_reader).await.unwrap();
+    assert_eq!(pong, Some(GuestMessage::Pong { id: "test-ping".to_string() }));
+
+    // Exec uname -a
+    write_async(
+        &mut guest_writer,
+        &HostMessage::Exec {
+            id: "e2e-exec".to_string(),
+            command: "uname".to_string(),
+            args: vec!["-a".to_string()],
+            env: HashMap::new(),
+            timeout_secs: 10,
+        },
+    )
+    .await
+    .unwrap();
+
+    let exec_res: Option<GuestMessage> = read_async(&mut guest_buf_reader).await.unwrap();
+    if let Some(GuestMessage::ExecResult { id, exit_code, stdout, stderr }) = exec_res {
+        assert_eq!(id, "e2e-exec");
+        assert_eq!(exit_code, 0);
+        assert!(stdout.contains("Linux"));
+        assert!(stderr.is_empty());
+    } else {
+        panic!("Expected ExecResult, got {:?}", exec_res);
+    }
+
+    // Graceful stop
+    vm.stop().expect("Failed to stop VM");
+}

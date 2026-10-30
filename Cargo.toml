@@ -1,0 +1,21 @@
+[workspace]
+members = [
+    "crates/maclet-common",
+    "crates/maclet-ipc",
+    "crates/maclet-vm",
+    "crates/maclet-cli",
+    "crates/maclet-guest-agent",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+authors = ["Maclet Maintainers"]
+license = "Apache-2.0"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"

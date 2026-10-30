@@ -1,0 +1,5 @@
+[env]
+SDKROOT = "/Library/Developer/CommandLineTools/SDKs/MacOSX26.5.sdk"
+
+[target.aarch64-unknown-linux-musl]
+linker = "/Users/sumant/.rustup/toolchains/stable-aarch64-apple-darwin/lib/rustlib/aarch64-apple-darwin/bin/gcc-ld/ld.lld"

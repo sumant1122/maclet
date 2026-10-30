@@ -1,0 +1,9 @@
+/target
+.DS_Store
+*.swp
+*~
+/tmp
+*.a
+*.o
+.maclet
+daemon.log

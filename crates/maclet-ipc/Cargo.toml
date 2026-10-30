@@ -1,0 +1,14 @@
+[package]
+name = "maclet-ipc"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+maclet-common = { path = "../maclet-common" }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tokio = { version = "1.38", features = ["io-util", "sync", "macros", "net"] }
+tokio-util = { version = "0.7", features = ["codec"] }
+bytes = "1.6"
