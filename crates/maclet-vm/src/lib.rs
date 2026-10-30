@@ -51,12 +51,18 @@ impl VirtualMachine {
         let cmdline_c = CString::new(config.cmdline.as_str())
             .map_err(|e| MacletError::Vm(format!("CString error: {e}")))?;
 
+        let disk_c = config.disk_path.as_ref().and_then(|p| {
+            p.to_str().and_then(|s| CString::new(s).ok())
+        });
+
         let vz_cfg = VzConfig {
             cpu_count: config.cpu_count as u32,
             memory_bytes: config.memory_mb * 1024 * 1024,
             kernel_path: kernel_c.as_ptr(),
             initrd_path: initrd_c.as_ptr(),
             cmdline: cmdline_c.as_ptr(),
+            disk_path: disk_c.as_ref().map(|c| c.as_ptr()).unwrap_or(std::ptr::null()),
+            enable_nat_network: if config.enable_nat { 1 } else { 0 },
         };
 
         let mut vm_ptr: VzVmPtr = std::ptr::null_mut();

@@ -13,6 +13,7 @@ path = "src/main.rs"
 maclet-common = { path = "../maclet-common" }
 maclet-ipc = { path = "../maclet-ipc" }
 maclet-vm = { path = "../maclet-vm" }
+maclet-image = { path = "../maclet-image" }
 clap = { version = "4.5", features = ["derive"] }
 tokio = { version = "1.38", features = ["full"] }
 flate2 = "1.0"

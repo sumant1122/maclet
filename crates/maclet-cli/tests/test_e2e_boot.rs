@@ -26,6 +26,8 @@ async fn test_vm_boot_and_handshake_and_exec() {
         kernel_path,
         initramfs_path,
         cmdline: "console=hvc0 rdinit=/init quiet".to_string(),
+        disk_path: None,
+        enable_nat: true,
     };
 
     let (mut vm, guest_channel) = VirtualMachine::start(&config, None)
@@ -85,6 +87,9 @@ async fn test_vm_boot_and_handshake_and_exec() {
             hostname: Some("test-e2e-box".to_string()),
             limits: None,
             detached: false,
+            ports: vec![],
+            read_only: false,
+            drop_caps: vec![],
             timeout_secs: 20,
         },
     )
@@ -125,6 +130,9 @@ async fn test_vm_boot_and_handshake_and_exec() {
                     .with_pids(50),
             ),
             detached: false,
+            ports: vec![],
+            read_only: false,
+            drop_caps: vec![],
             timeout_secs: 20,
         },
     )
@@ -156,6 +164,9 @@ async fn test_vm_boot_and_handshake_and_exec() {
             hostname: Some("worker-host".to_string()),
             limits: None,
             detached: true,
+            ports: vec![],
+            read_only: false,
+            drop_caps: vec![],
             timeout_secs: 10,
         },
     )

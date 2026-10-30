@@ -11,6 +11,8 @@ maclet-ipc = { path = "../maclet-ipc" }
 maclet-namespaces = { path = "../maclet-namespaces" }
 maclet-container = { path = "../maclet-container" }
 maclet-cgroups = { path = "../maclet-cgroups" }
+maclet-storage = { path = "../maclet-storage" }
+maclet-network = { path = "../maclet-network" }
 libc = "0.2"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"

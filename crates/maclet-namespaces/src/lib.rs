@@ -15,6 +15,11 @@ pub struct ContainerConfig {
     pub args: Vec<String>,
     pub env: HashMap<String, String>,
     pub cgroup_path: Option<PathBuf>,
+    pub netns_enabled: bool,
+    pub assigned_ip: Option<std::net::Ipv4Addr>,
+    pub ports: Vec<String>,
+    pub read_only: bool,
+    pub drop_caps: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -109,6 +114,16 @@ fn spawn_linux_namespaces(
             }
         }
 
+        let mut sync_pipe = [0i32; 2];
+        if config.netns_enabled {
+            unsafe {
+                if libc::pipe(sync_pipe.as_mut_ptr()) != 0 {
+                    libc::close(pid_pipe[1]);
+                    libc::_exit(1);
+                }
+            }
+        }
+
         let container_pid = unsafe { libc::fork() };
         if container_pid < 0 {
             unsafe {
@@ -121,6 +136,16 @@ fn spawn_linux_namespaces(
             // --- Container Init Process (PID 1 inside container PID namespace) ---
             unsafe {
                 libc::close(pid_pipe[1]);
+            }
+
+            if config.netns_enabled {
+                unsafe {
+                    let _ = libc::unshare(libc::CLONE_NEWNET);
+                    libc::close(sync_pipe[1]);
+                    let mut b = 0u8;
+                    libc::read(sync_pipe[0], &mut b as *mut u8 as *mut libc::c_void, 1);
+                    libc::close(sync_pipe[0]);
+                }
             }
 
             if let Some(ref cg) = config.cgroup_path {
@@ -178,10 +203,39 @@ fn spawn_linux_namespaces(
             libc::close(pid_pipe[1]);
         }
 
+        // Supervisor: configure container network namespace if enabled
+        if config.netns_enabled {
+            unsafe {
+                libc::close(sync_pipe[0]);
+            }
+            if let Some(ip) = config.assigned_ip {
+                let net_mgr = maclet_network::NetworkManager::new();
+                let _ = net_mgr.init_host_network();
+                let _ = net_mgr.setup_container_network(&config.id, container_pid as u32, ip);
+                for p in &config.ports {
+                    if let Some((hp, cp)) = p.split_once(':') {
+                        if let (Ok(h_port), Ok(c_port)) = (hp.parse::<u16>(), cp.parse::<u16>()) {
+                            let _ = net_mgr.forward_port(h_port, ip, c_port);
+                        }
+                    }
+                }
+            }
+            unsafe {
+                let b = 1u8;
+                libc::write(sync_pipe[1], &b as *const u8 as *const libc::c_void, 1);
+                libc::close(sync_pipe[1]);
+            }
+        }
+
         // Wait for container init process to finish
         let mut status: i32 = 0;
         unsafe {
             libc::waitpid(container_pid, &mut status, 0);
+        }
+
+        if config.netns_enabled {
+            let net_mgr = maclet_network::NetworkManager::new();
+            let _ = net_mgr.teardown_container_network(&config.id);
         }
         let code = if libc::WIFEXITED(status) {
             libc::WEXITSTATUS(status)
@@ -258,6 +312,7 @@ fn exec_linux_namespaces(
         let ns_list = [
             (format!("/proc/{}/ns/ipc", container_pid), libc::CLONE_NEWIPC),
             (format!("/proc/{}/ns/uts", container_pid), libc::CLONE_NEWUTS),
+            (format!("/proc/{}/ns/net", container_pid), libc::CLONE_NEWNET),
             (format!("/proc/{}/ns/cgroup", container_pid), libc::CLONE_NEWCGROUP),
             (format!("/proc/{}/ns/pid", container_pid), libc::CLONE_NEWPID),
             (format!("/proc/{}/ns/mnt", container_pid), libc::CLONE_NEWNS),
@@ -313,6 +368,11 @@ fn exec_linux_namespaces(
                 args: args.to_vec(),
                 env: env.clone(),
                 cgroup_path: None,
+                netns_enabled: false,
+                assigned_ip: None,
+                ports: vec![],
+                read_only: false,
+                drop_caps: vec![],
             };
             execute_payload(&cmd_cfg);
             unsafe { libc::_exit(127) };
@@ -432,6 +492,15 @@ fn run_linux_namespaces(config: &ContainerConfig) -> Result<ExecutionResult> {
             }
         }
 
+        let mut sync_pipe = [0i32; 2];
+        if config.netns_enabled {
+            unsafe {
+                if libc::pipe(sync_pipe.as_mut_ptr()) != 0 {
+                    libc::_exit(1);
+                }
+            }
+        }
+
         // Fork the container init process (which becomes PID 1 in the new PID namespace!)
         let container_pid = unsafe { libc::fork() };
         if container_pid < 0 {
@@ -448,6 +517,16 @@ fn run_linux_namespaces(config: &ContainerConfig) -> Result<ExecutionResult> {
         }
 
         if container_pid == 0 {
+            if config.netns_enabled {
+                unsafe {
+                    let _ = libc::unshare(libc::CLONE_NEWNET);
+                    libc::close(sync_pipe[1]);
+                    let mut b = 0u8;
+                    libc::read(sync_pipe[0], &mut b as *mut u8 as *mut libc::c_void, 1);
+                    libc::close(sync_pipe[0]);
+                }
+            }
+
             // Attach to cgroup v2 if specified
             if let Some(ref cg) = config.cgroup_path {
                 let procs_file = cg.join("cgroup.procs");
@@ -477,6 +556,30 @@ fn run_linux_namespaces(config: &ContainerConfig) -> Result<ExecutionResult> {
             unsafe { libc::_exit(127) };
         }
 
+        // Intermediate supervisor: configure network if enabled
+        if config.netns_enabled {
+            unsafe {
+                libc::close(sync_pipe[0]);
+            }
+            if let Some(ip) = config.assigned_ip {
+                let net_mgr = maclet_network::NetworkManager::new();
+                let _ = net_mgr.init_host_network();
+                let _ = net_mgr.setup_container_network(&config.id, container_pid as u32, ip);
+                for p in &config.ports {
+                    if let Some((hp, cp)) = p.split_once(':') {
+                        if let (Ok(h_port), Ok(c_port)) = (hp.parse::<u16>(), cp.parse::<u16>()) {
+                            let _ = net_mgr.forward_port(h_port, ip, c_port);
+                        }
+                    }
+                }
+            }
+            unsafe {
+                let b = 1u8;
+                libc::write(sync_pipe[1], &b as *const u8 as *const libc::c_void, 1);
+                libc::close(sync_pipe[1]);
+            }
+        }
+
         // Intermediate supervisor: wait for container init process
         unsafe {
             libc::close(stdout_pipe[1]);
@@ -484,6 +587,11 @@ fn run_linux_namespaces(config: &ContainerConfig) -> Result<ExecutionResult> {
 
             let mut status = 0i32;
             libc::waitpid(container_pid, &mut status, 0);
+
+            if config.netns_enabled {
+                let net_mgr = maclet_network::NetworkManager::new();
+                let _ = net_mgr.teardown_container_network(&config.id);
+            }
 
             let exit_code = if libc::WIFEXITED(status) {
                 libc::WEXITSTATUS(status)
@@ -715,12 +823,125 @@ fn setup_container_root(config: &ContainerConfig) -> Result<()> {
     }
     let _ = fs::remove_dir("/.old_root");
 
+    // 14. If read_only is requested, remount / as read-only
+    if config.read_only {
+        let none: *const libc::c_char = std::ptr::null();
+        let slash_c = CString::new("/").unwrap();
+        unsafe {
+            let _ = libc::mount(
+                none,
+                slash_c.as_ptr(),
+                none,
+                libc::MS_BIND | libc::MS_REMOUNT | libc::MS_RDONLY,
+                std::ptr::null(),
+            );
+        }
+    }
+
     Ok(())
 }
 
 #[cfg(target_os = "linux")]
+fn cap_name_to_num(cap: &str) -> Option<libc::c_ulong> {
+    let cap_upper = cap.trim().to_uppercase();
+    match cap_upper.as_str() {
+        "CAP_CHOWN" | "CHOWN" => Some(0),
+        "CAP_DAC_OVERRIDE" | "DAC_OVERRIDE" => Some(1),
+        "CAP_DAC_READ_SEARCH" | "DAC_READ_SEARCH" => Some(2),
+        "CAP_FOWNER" | "FOWNER" => Some(3),
+        "CAP_FSETID" | "FSETID" => Some(4),
+        "CAP_KILL" | "KILL" => Some(5),
+        "CAP_SETGID" | "SETGID" => Some(6),
+        "CAP_SETUID" | "SETUID" => Some(7),
+        "CAP_SETPCAP" | "SETPCAP" => Some(8),
+        "CAP_LINUX_IMMUTABLE" | "LINUX_IMMUTABLE" => Some(9),
+        "CAP_NET_BIND_SERVICE" | "NET_BIND_SERVICE" => Some(10),
+        "CAP_NET_BROADCAST" | "NET_BROADCAST" => Some(11),
+        "CAP_NET_ADMIN" | "NET_ADMIN" => Some(12),
+        "CAP_NET_RAW" | "NET_RAW" => Some(13),
+        "CAP_IPC_LOCK" | "IPC_LOCK" => Some(14),
+        "CAP_IPC_OWNER" | "IPC_OWNER" => Some(15),
+        "CAP_SYS_MODULE" | "SYS_MODULE" => Some(16),
+        "CAP_SYS_RAWIO" | "SYS_RAWIO" => Some(17),
+        "CAP_SYS_CHROOT" | "SYS_CHROOT" => Some(18),
+        "CAP_SYS_PTRACE" | "SYS_PTRACE" => Some(19),
+        "CAP_SYS_PACCT" | "SYS_PACCT" => Some(20),
+        "CAP_SYS_ADMIN" | "SYS_ADMIN" => Some(21),
+        "CAP_SYS_BOOT" | "SYS_BOOT" => Some(22),
+        "CAP_SYS_NICE" | "SYS_NICE" => Some(23),
+        "CAP_SYS_RESOURCE" | "SYS_RESOURCE" => Some(24),
+        "CAP_SYS_TIME" | "SYS_TIME" => Some(25),
+        "CAP_SYS_TTY_CONFIG" | "SYS_TTY_CONFIG" => Some(26),
+        "CAP_MKNOD" | "MKNOD" => Some(27),
+        "CAP_LEASE" | "LEASE" => Some(28),
+        "CAP_AUDIT_WRITE" | "AUDIT_WRITE" => Some(29),
+        "CAP_AUDIT_CONTROL" | "AUDIT_CONTROL" => Some(30),
+        "CAP_SETFCAP" | "SETFCAP" => Some(31),
+        "CAP_MAC_OVERRIDE" | "MAC_OVERRIDE" => Some(32),
+        "CAP_MAC_ADMIN" | "MAC_ADMIN" => Some(33),
+        "CAP_SYSLOG" | "SYSLOG" => Some(34),
+        "CAP_WAKE_ALARM" | "WAKE_ALARM" => Some(35),
+        "CAP_BLOCK_SUSPEND" | "BLOCK_SUSPEND" => Some(36),
+        "CAP_AUDIT_READ" | "AUDIT_READ" => Some(37),
+        _ => cap.parse::<libc::c_ulong>().ok(),
+    }
+}
+
+#[cfg(target_os = "linux")]
+unsafe fn apply_security_boundaries(config: &ContainerConfig) {
+    // 1. Enforce PR_SET_NO_NEW_PRIVS (prevents child processes from acquiring new privileges)
+    libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);
+
+    // 2. Drop capability bounding set
+    let caps_to_drop = if config.drop_caps.is_empty() {
+        // Standard security hardening defaults
+        vec![
+            16, // CAP_SYS_MODULE
+            17, // CAP_SYS_RAWIO
+            21, // CAP_SYS_ADMIN
+            22, // CAP_SYS_BOOT
+            30, // CAP_AUDIT_CONTROL
+        ]
+    } else {
+        config
+            .drop_caps
+            .iter()
+            .filter_map(|c| cap_name_to_num(c))
+            .collect()
+    };
+
+    for cap in caps_to_drop {
+        libc::prctl(libc::PR_CAPBSET_DROP, cap, 0, 0, 0);
+    }
+}
+
+#[cfg(target_os = "linux")]
 fn execute_payload(config: &ContainerConfig) {
-    let cmd_c = match CString::new(config.command.as_str()) {
+    // Apply Linux security boundaries (No-new-privs & drop bounding caps)
+    unsafe {
+        apply_security_boundaries(config);
+    }
+
+    let resolved_path = if config.command.contains('/') {
+        PathBuf::from(&config.command)
+    } else {
+        let path_var = config
+            .env
+            .get("PATH")
+            .cloned()
+            .unwrap_or_else(|| "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".to_string());
+        let mut found = PathBuf::from(&config.command);
+        for dir in path_var.split(':') {
+            let candidate = Path::new(dir).join(&config.command);
+            if candidate.exists() {
+                found = candidate;
+                break;
+            }
+        }
+        found
+    };
+
+    let cmd_c = match CString::new(resolved_path.to_string_lossy().as_bytes()) {
         Ok(c) => c,
         Err(e) => {
             eprintln!("Invalid command string: {}", e);
@@ -779,8 +1000,14 @@ mod tests {
             args: vec!["-c".to_string(), "echo hi".to_string()],
             env: HashMap::new(),
             cgroup_path: Some(PathBuf::from("/sys/fs/cgroup/maclet/test-1")),
+            netns_enabled: true,
+            assigned_ip: None,
+            ports: vec!["8080:80".to_string()],
+            read_only: false,
+            drop_caps: vec!["CAP_SYS_ADMIN".to_string()],
         };
         assert_eq!(cfg.id, "test-1");
         assert_eq!(cfg.hostname, "maclet-test");
+        assert!(cfg.netns_enabled);
     }
 }

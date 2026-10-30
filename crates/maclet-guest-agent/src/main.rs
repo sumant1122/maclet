@@ -35,6 +35,29 @@ extern "C" {
 }
 
 #[cfg(target_os = "linux")]
+unsafe fn load_kernel_module(path: &Path) {
+    use std::io::Read;
+    if let Ok(mut f) = File::open(path) {
+        let mut data = Vec::new();
+        if f.read_to_end(&mut data).is_ok() {
+            let empty = b"\0".as_ptr() as *const libc::c_char;
+            let ret = libc::syscall(
+                105, // __NR_init_module on arm64
+                data.as_ptr() as *const libc::c_void,
+                data.len() as libc::size_t,
+                empty,
+            );
+            if ret != 0 {
+                let err = std::io::Error::last_os_error();
+                if err.raw_os_error() != Some(17) {
+                    eprintln!("[Kernel Module] Failed to load {}: {}", path.display(), err);
+                }
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
 unsafe fn mount_pseudo_filesystems() {
     // Mount proc
     if !Path::new("/proc/uptime").exists() {
@@ -72,6 +95,7 @@ unsafe fn mount_pseudo_filesystems() {
 }
 
 #[cfg(target_os = "linux")]
+#[allow(dead_code)]
 unsafe fn switch_to_tmpfs_root() {
     let mountinfo = fs::read_to_string("/proc/self/mountinfo").unwrap_or_default();
     if !mountinfo.contains("rootfs / rootfs") {
@@ -114,6 +138,14 @@ unsafe fn switch_to_tmpfs_root() {
     let _ = fs::create_dir_all("/sysroot/proc");
     let _ = fs::create_dir_all("/sysroot/sys");
     let _ = fs::create_dir_all("/sysroot/dev");
+    let _ = fs::create_dir_all("/sysroot/lib/modules");
+
+    if let Ok(entries) = fs::read_dir("/lib/modules") {
+        for entry in entries.flatten() {
+            let dst = Path::new("/sysroot/lib/modules").join(entry.file_name());
+            let _ = fs::copy(entry.path(), dst);
+        }
+    }
 
     // 3. Move pseudo filesystems to /sysroot
     let proc_c = b"/proc\0".as_ptr();
@@ -244,21 +276,30 @@ fn get_uptime_secs() -> u64 {
 
 fn ensure_base_rootfs() {
     let target_dir = Path::new("/var/lib/maclet/rootfs");
-    if target_dir.join("bin/sh").exists() {
-        return;
-    }
-
     let archive_path = Path::new("/rootfs.tar.gz");
-    if !archive_path.exists() {
-        return;
+
+    if archive_path.exists() {
+        if !Path::new("/bin/sh").exists() {
+            if let Ok(f) = File::open(archive_path) {
+                let gz = GzDecoder::new(f);
+                let mut archive = Archive::new(gz);
+                let _ = archive.unpack("/");
+            }
+        }
+        if !target_dir.join("bin/sh").exists() {
+            let _ = fs::create_dir_all(target_dir);
+            if let Ok(f) = File::open(archive_path) {
+                let gz = GzDecoder::new(f);
+                let mut archive = Archive::new(gz);
+                let _ = archive.unpack(target_dir);
+            }
+        }
     }
 
-    let _ = fs::create_dir_all(target_dir);
-    if let Ok(f) = File::open(archive_path) {
-        let gz = GzDecoder::new(f);
-        let mut archive = Archive::new(gz);
-        let _ = archive.unpack(target_dir);
-    }
+    let _ = fs::create_dir_all("/etc");
+    let _ = fs::write("/etc/resolv.conf", "nameserver 1.1.1.1\nnameserver 8.8.8.8\n");
+    let _ = fs::create_dir_all("/var/lib/maclet/rootfs/etc");
+    let _ = fs::write("/var/lib/maclet/rootfs/etc/resolv.conf", "nameserver 1.1.1.1\nnameserver 8.8.8.8\n");
 }
 
 #[cfg(target_os = "linux")]
@@ -368,6 +409,9 @@ fn handle_exec(
     // 2. Spawn external process
     let mut cmd = Command::new(&cmd_name);
     cmd.args(&args);
+    if !env.contains_key("PATH") {
+        cmd.env("PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin");
+    }
     for (k, v) in env {
         cmd.env(k, v);
     }
@@ -417,12 +461,22 @@ fn handle_run_container(
     hostname: Option<String>,
     limits: Option<ResourceLimits>,
     detached: bool,
+    ports: Vec<String>,
+    read_only: bool,
+    drop_caps: Vec<String>,
 ) -> GuestMessage {
     let base_rootfs = Path::new("/var/lib/maclet/rootfs");
     let container_name = name.unwrap_or_else(|| {
         let short = if id.len() > 12 { &id[..12] } else { &id };
         format!("cnt-{}", short)
     });
+
+    let assigned_ip = if !ports.is_empty() {
+        let net_mgr = maclet_network::NetworkManager::new();
+        Some(net_mgr.allocate_ip())
+    } else {
+        None
+    };
 
     match Container::new(
         id.clone(),
@@ -432,6 +486,10 @@ fn handle_run_container(
         env.clone(),
         hostname.clone(),
         limits.clone(),
+        ports.clone(),
+        read_only,
+        drop_caps.clone(),
+        assigned_ip,
     ) {
         Ok(container) => {
             let container_dir = PathBuf::from(format!("/var/lib/maclet/containers/{}", id));
@@ -464,6 +522,10 @@ fn handle_run_container(
                 metrics: None,
                 rootfs_path: container.rootfs.to_string_lossy().to_string(),
                 log_path: log_path.to_string_lossy().to_string(),
+                ip: assigned_ip.map(|ip| ip.to_string()),
+                ports: ports.clone(),
+                read_only,
+                drop_caps,
             };
 
             if detached {
@@ -596,6 +658,8 @@ fn handle_list_containers(
                         exit_code: details.exit_code,
                         memory_current: mem_cur,
                         memory_max: mem_max,
+                        ip: details.ip,
+                        ports: details.ports,
                     });
                 }
             }
@@ -606,14 +670,42 @@ fn handle_list_containers(
     GuestMessage::ContainerList { containers: list }
 }
 
-fn handle_stop_container(id: String, timeout_secs: u64) -> GuestMessage {
-    let container_dir = PathBuf::from(format!("/var/lib/maclet/containers/{}", id));
-    if !container_dir.exists() {
-        return GuestMessage::Error {
-            id: Some(id),
-            message: "No such container".to_string(),
-        };
+fn find_container(target: &str) -> Option<(String, PathBuf)> {
+    let exact = PathBuf::from(format!("/var/lib/maclet/containers/{}", target));
+    if exact.exists() {
+        return Some((target.to_string(), exact));
     }
+
+    if let Ok(entries) = fs::read_dir("/var/lib/maclet/containers") {
+        for entry in entries.flatten() {
+            let p = entry.path();
+            let dirname = entry.file_name().to_string_lossy().to_string();
+            if dirname.starts_with(target) {
+                return Some((dirname, p));
+            }
+            let meta_file = p.join("meta.json");
+            if let Ok(meta_str) = fs::read_to_string(meta_file) {
+                if let Ok(details) = serde_json::from_str::<ContainerInspectDetails>(&meta_str) {
+                    if details.name == target {
+                        return Some((details.id, p));
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+fn handle_stop_container(target: String, timeout_secs: u64) -> GuestMessage {
+    let (id, container_dir) = match find_container(&target) {
+        Some(pair) => pair,
+        None => {
+            return GuestMessage::Error {
+                id: Some(target),
+                message: "No such container".to_string(),
+            };
+        }
+    };
 
     let pid_file = container_dir.join("pid");
     let pid = fs::read_to_string(&pid_file)
@@ -672,17 +764,19 @@ fn handle_stop_container(id: String, timeout_secs: u64) -> GuestMessage {
 }
 
 fn handle_remove_container(
-    id: String,
+    target: String,
     force: bool,
     cgroup_mgr: &maclet_cgroups::CgroupV2Manager,
 ) -> GuestMessage {
-    let container_dir = PathBuf::from(format!("/var/lib/maclet/containers/{}", id));
-    if !container_dir.exists() {
-        return GuestMessage::Error {
-            id: Some(id.clone()),
-            message: format!("No such container: {}", id),
-        };
-    }
+    let (id, container_dir) = match find_container(&target) {
+        Some(pair) => pair,
+        None => {
+            return GuestMessage::Error {
+                id: Some(target.clone()),
+                message: format!("No such container: {}", target),
+            };
+        }
+    };
 
     let pid_file = container_dir.join("pid");
     let pid = fs::read_to_string(&pid_file)
@@ -727,7 +821,16 @@ fn handle_remove_container(
     GuestMessage::ContainerRemoved { id }
 }
 
-fn handle_container_logs(id: String, tail: Option<usize>) -> GuestMessage {
+fn handle_container_logs(target: String, tail: Option<usize>) -> GuestMessage {
+    let (id, _) = match find_container(&target) {
+        Some(pair) => pair,
+        None => {
+            return GuestMessage::Error {
+                id: Some(target.clone()),
+                message: format!("No such container: {}", target),
+            };
+        }
+    };
     let log_path = format!("/var/log/maclet/{}.log", id);
     match fs::read_to_string(&log_path) {
         Ok(content) => {
@@ -751,18 +854,20 @@ fn handle_container_logs(id: String, tail: Option<usize>) -> GuestMessage {
 }
 
 fn handle_exec_in_container(
-    id: String,
+    target: String,
     command: String,
     args: Vec<String>,
     env: HashMap<String, String>,
 ) -> GuestMessage {
-    let container_dir = PathBuf::from(format!("/var/lib/maclet/containers/{}", id));
-    if !container_dir.exists() {
-        return GuestMessage::Error {
-            id: Some(id.clone()),
-            message: format!("No such container: {}", id),
-        };
-    }
+    let (id, container_dir) = match find_container(&target) {
+        Some(pair) => pair,
+        None => {
+            return GuestMessage::Error {
+                id: Some(target.clone()),
+                message: format!("No such container: {}", target),
+            };
+        }
+    };
 
     let pid_file = container_dir.join("pid");
     let pid = match fs::read_to_string(&pid_file)
@@ -800,10 +905,18 @@ fn handle_exec_in_container(
 }
 
 fn handle_inspect_container(
-    id: String,
+    target: String,
     cgroup_mgr: &maclet_cgroups::CgroupV2Manager,
 ) -> GuestMessage {
-    let container_dir = PathBuf::from(format!("/var/lib/maclet/containers/{}", id));
+    let (id, container_dir) = match find_container(&target) {
+        Some(pair) => pair,
+        None => {
+            return GuestMessage::Error {
+                id: Some(target.clone()),
+                message: format!("Container '{}' not found", target),
+            };
+        }
+    };
     let meta_path = container_dir.join("meta.json");
 
     if let Ok(meta_str) = fs::read_to_string(&meta_path) {
@@ -846,19 +959,82 @@ fn handle_inspect_container(
 }
 
 fn run_agent() -> Result<()> {
+    std::env::set_var(
+        "PATH",
+        "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+    );
+
     #[cfg(target_os = "linux")]
     if std::process::id() == 1 {
         unsafe {
             mount_pseudo_filesystems();
-            switch_to_tmpfs_root();
         };
     }
+
+    ensure_base_rootfs();
 
     // Initialize cgroups v2 hierarchy
     let cgroup_mgr = maclet_cgroups::CgroupV2Manager::new();
     let _ = cgroup_mgr.init();
 
-    ensure_base_rootfs();
+    #[cfg(target_os = "linux")]
+    {
+        // Load core kernel modules
+        unsafe {
+            load_kernel_module(Path::new("/lib/modules/overlay.ko"));
+            load_kernel_module(Path::new("/lib/modules/squashfs.ko"));
+            load_kernel_module(Path::new("/lib/modules/loop.ko"));
+            load_kernel_module(Path::new("/lib/modules/virtio_blk.ko"));
+        }
+
+        // Mount /dev/vda if attached
+        if Path::new("/dev/vda").exists() {
+            let _ = fs::create_dir_all("/.modloop");
+            let vda_c = std::ffi::CString::new("/dev/vda").unwrap();
+            let mnt_c = std::ffi::CString::new("/.modloop").unwrap();
+            let sq_c = std::ffi::CString::new("squashfs").unwrap();
+            unsafe {
+                libc::mount(
+                    vda_c.as_ptr(),
+                    mnt_c.as_ptr(),
+                    sq_c.as_ptr(),
+                    libc::MS_RDONLY,
+                    std::ptr::null(),
+                );
+            }
+            if let Ok(entries) = fs::read_dir("/.modloop/modules") {
+                let _ = fs::create_dir_all("/lib/modules");
+                for entry in entries.flatten() {
+                    let kver = entry.file_name();
+                    let target = Path::new("/lib/modules").join(&kver);
+                    let _ = std::os::unix::fs::symlink(entry.path(), target);
+                }
+            }
+            let _ = Command::new("modprobe").arg("bridge").status();
+            let _ = Command::new("modprobe").arg("veth").status();
+        }
+
+        // Load network drivers
+        unsafe {
+            load_kernel_module(Path::new("/lib/modules/af_packet.ko"));
+            load_kernel_module(Path::new("/lib/modules/failover.ko"));
+            load_kernel_module(Path::new("/lib/modules/net_failover.ko"));
+            load_kernel_module(Path::new("/lib/modules/virtio_net.ko"));
+        }
+
+        // Initialize guest eth0 NAT interface if present
+        if Path::new("/sys/class/net/eth0").exists() {
+            let _ = Command::new("ip").args(["link", "set", "eth0", "up"]).status();
+            let _ = Command::new("udhcpc")
+                .args(["-i", "eth0", "-q", "-n", "-t", "3"])
+                .status();
+        }
+
+        // Initialize host bridge maclet0
+        let net_mgr = maclet_network::NetworkManager::new();
+        let _ = net_mgr.init_host_network();
+    }
+
     let _ = fs::create_dir_all("/var/lib/maclet/containers");
     let _ = fs::create_dir_all("/var/log/maclet");
 
@@ -900,6 +1076,9 @@ fn run_agent() -> Result<()> {
                 hostname,
                 limits,
                 detached,
+                ports,
+                read_only,
+                drop_caps,
                 timeout_secs: _,
             } => {
                 let result = handle_run_container(
@@ -912,6 +1091,9 @@ fn run_agent() -> Result<()> {
                     hostname,
                     limits,
                     detached,
+                    ports,
+                    read_only,
+                    drop_caps,
                 );
                 write_sync(&mut writer, &result)?;
             }

@@ -73,7 +73,12 @@ pub fn build_guest_agent(workspace_root: &Path) -> Result<PathBuf> {
     Ok(binary)
 }
 
-pub fn create_initramfs(agent_binary: &Path, rootfs_tar: &Path, output_path: &Path) -> Result<()> {
+pub fn create_initramfs(
+    agent_binary: &Path,
+    rootfs_tar: &Path,
+    modules_dir: Option<&Path>,
+    output_path: &Path,
+) -> Result<()> {
     println!("Packaging initramfs with /init and rootfs.tar.gz...");
     let mut file = File::open(agent_binary)
         .context("Failed to open guest agent binary")?;
@@ -91,7 +96,10 @@ pub fn create_initramfs(agent_binary: &Path, rootfs_tar: &Path, output_path: &Pa
     let mut cpio = CpioWriter::new(gz);
 
     // Standard directories (mode 0o040755)
-    for dir in &["proc", "sys", "dev", "tmp", "bin", "etc", "var", "var/lib", "var/lib/maclet"] {
+    for dir in &[
+        "proc", "sys", "dev", "tmp", "bin", "etc", "var", "var/lib", "var/lib/maclet",
+        "lib", "lib/modules",
+    ] {
         cpio.write_entry(dir, 0o040755, 0, 0, &[])?;
     }
 
@@ -100,6 +108,30 @@ pub fn create_initramfs(agent_binary: &Path, rootfs_tar: &Path, output_path: &Pa
 
     // Write /rootfs.tar.gz
     cpio.write_entry("rootfs.tar.gz", 0o100644, 0, 0, &rootfs_data)?;
+
+    // Write essential modules if present
+    if let Some(mod_dir) = modules_dir {
+        for mod_name in &[
+            "overlay.ko",
+            "squashfs.ko",
+            "loop.ko",
+            "virtio_blk.ko",
+            "af_packet.ko",
+            "failover.ko",
+            "net_failover.ko",
+            "virtio_net.ko",
+        ] {
+            let p = mod_dir.join(mod_name);
+            if p.exists() {
+                if let Ok(mut mf) = File::open(&p) {
+                    let mut mod_data = Vec::new();
+                    if mf.read_to_end(&mut mod_data).is_ok() {
+                        cpio.write_entry(&format!("lib/modules/{}", mod_name), 0o100644, 0, 0, &mod_data)?;
+                    }
+                }
+            }
+        }
+    }
 
     let mut gz_done = cpio.finish()?;
     use std::io::Write;

@@ -10,6 +10,8 @@ pub struct VzConfig {
     pub kernel_path: *const c_char,
     pub initrd_path: *const c_char,
     pub cmdline: *const c_char,
+    pub disk_path: *const c_char,
+    pub enable_nat_network: u8,
 }
 
 extern "C" {

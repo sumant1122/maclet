@@ -1,0 +1,12 @@
+[package]
+name = "maclet-storage"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+maclet-common = { path = "../maclet-common" }
+libc = "0.2"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"

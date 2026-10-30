@@ -16,6 +16,8 @@ typedef struct {
     const char *kernel_path;
     const char *initrd_path;
     const char *cmdline;
+    const char *disk_path;
+    uint8_t enable_nat_network;
 } VzConfig;
 
 int32_t vz_is_supported(void);

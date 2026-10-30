@@ -99,6 +99,28 @@ public func vz_create_vm(
     
     vmConfig.serialPorts = serialPorts
     vmConfig.entropyDevices = [VZVirtioEntropyDeviceConfiguration()]
+
+    // NAT Networking (Phase 6)
+    if config.enable_nat_network != 0 {
+        let netConfig = VZVirtioNetworkDeviceConfiguration()
+        netConfig.attachment = VZNATNetworkDeviceAttachment()
+        vmConfig.networkDevices = [netConfig]
+    }
+
+    // Virtio Block Storage (Phase 5 & 6 kernel modules / disk)
+    if let diskPathStr = config.disk_path {
+        let diskURL = URL(fileURLWithPath: String(cString: diskPathStr))
+        if FileManager.default.fileExists(atPath: diskURL.path) {
+            do {
+                let attachment = try VZDiskImageStorageDeviceAttachment(url: diskURL, readOnly: true)
+                let blockConfig = VZVirtioBlockDeviceConfiguration(attachment: attachment)
+                vmConfig.storageDevices = [blockConfig]
+            } catch {
+                writeError("Failed to attach disk: \(error.localizedDescription)", to: errBuf, capacity: errLen)
+                return -1
+            }
+        }
+    }
     
     do {
         try vmConfig.validate()

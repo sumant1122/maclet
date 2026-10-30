@@ -1,0 +1,18 @@
+[package]
+name = "maclet-image"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+maclet-common = { path = "../maclet-common" }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sha2 = "0.10"
+flate2 = "1.0"
+tar = "0.4"
+anyhow = "1.0"
+futures-util = "0.3"

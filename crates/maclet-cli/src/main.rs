@@ -48,6 +48,15 @@ enum Commands {
         args: Vec<String>,
     },
 
+    /// Pull an OCI image from registry (Docker Hub, GHCR)
+    Pull {
+        /// Image reference (e.g. ubuntu:24.04, alpine:latest, ghcr.io/...)
+        image: String,
+    },
+
+    /// List local container images
+    Images,
+
     /// Run an isolated Linux container with genuine namespaces, cgroups, and rootfs
     #[command(trailing_var_arg = true)]
     Run {
@@ -59,9 +68,12 @@ enum Commands {
         #[arg(long = "name")]
         name: Option<String>,
 
-        /// Container command to execute
-        #[arg(default_value = "/bin/sh")]
-        command: String,
+        /// Image or command to execute (e.g. ubuntu:24.04, alpine:latest, /bin/sh)
+        image: String,
+
+        /// Optional command to execute inside container
+        #[arg(allow_hyphen_values = true)]
+        command: Option<String>,
 
         /// Arguments for the command
         #[arg(allow_hyphen_values = true)]
@@ -82,6 +94,18 @@ enum Commands {
         /// Maximum number of concurrent processes
         #[arg(long = "pids-limit")]
         pids_limit: Option<u64>,
+
+        /// Publish a container's port(s) to the host (e.g. -p 8080:80)
+        #[arg(short = 'p', long = "publish")]
+        publish: Vec<String>,
+
+        /// Mount the container's root filesystem as read only
+        #[arg(long = "read-only")]
+        read_only: bool,
+
+        /// Drop Linux capabilities (e.g. CAP_SYS_ADMIN, CAP_SYS_MODULE)
+        #[arg(long = "cap-drop")]
+        cap_drop: Vec<String>,
 
         /// Display cgroup v2 resource usage statistics upon completion
         #[arg(long)]
@@ -137,8 +161,20 @@ enum Commands {
         id: Option<String>,
     },
 
+    /// Manage Maclet system and host information
+    System {
+        #[command(subcommand)]
+        command: SystemCommands,
+    },
+
     /// Display version and environment information
     Version,
+}
+
+#[derive(Subcommand)]
+enum SystemCommands {
+    /// Display system and runtime information
+    Info,
 }
 
 #[derive(Subcommand)]
@@ -219,13 +255,18 @@ async fn handle_init(cpus: usize, memory: u64) -> Result<()> {
     let kernel_path = kernel::ensure_kernel(&kernel_dir)?;
     println!("Kernel ready at: {}", kernel_path.display().to_string().green());
 
+    let modloop_path = kernel::ensure_modloop(&kernel_dir)?;
+    println!("Kernel modules ready at: {}", modloop_path.display().to_string().green());
+
+    let modules_dir = kernel::ensure_essential_modules(&kernel_dir)?;
+
     let rootfs_tar = initramfs::ensure_rootfs_tar(&kernel_dir)?;
     println!("Base rootfs ready at: {}", rootfs_tar.display().to_string().green());
 
     let workspace_root = find_workspace_root()?;
     let guest_bin = initramfs::build_guest_agent(&workspace_root)?;
     let initramfs_path = kernel_dir.join("initrd.img");
-    initramfs::create_initramfs(&guest_bin, &rootfs_tar, &initramfs_path)?;
+    initramfs::create_initramfs(&guest_bin, &rootfs_tar, Some(&modules_dir), &initramfs_path)?;
 
     let config = VmConfig {
         cpu_count: cpus,
@@ -233,6 +274,8 @@ async fn handle_init(cpus: usize, memory: u64) -> Result<()> {
         kernel_path,
         initramfs_path,
         cmdline: "console=hvc0 rdinit=/init quiet".to_string(),
+        disk_path: Some(modloop_path),
+        enable_nat: true,
     };
 
     let config_json = serde_json::to_string_pretty(&config)?;
@@ -501,10 +544,25 @@ async fn handle_exec(target: String, command: Option<String>, args: Vec<String>)
     let (r, mut w) = stream.into_split();
     let mut buf_r = tokio::io::BufReader::new(r);
 
-    if let Some(cmd) = command {
+    // Differentiate between container exec and VM exec
+    let is_container = if target.starts_with("cnt-") {
+        true
+    } else {
+        let req = HostMessage::ListContainers { all: true };
+        write_async(&mut w, &req).await?;
+        let resp: Option<GuestMessage> = read_async(&mut buf_r).await?;
+        if let Some(GuestMessage::ContainerList { containers }) = resp {
+            containers.iter().any(|c| c.id == target || c.name == target || c.id.starts_with(&target))
+        } else {
+            false
+        }
+    };
+
+    if is_container {
+        let exec_cmd = command.unwrap_or_else(|| "/bin/sh".to_string());
         let req = HostMessage::ExecInContainer {
             id: target.clone(),
-            command: cmd,
+            command: exec_cmd,
             args,
             env: HashMap::new(),
         };
@@ -535,6 +593,12 @@ async fn handle_exec(target: String, command: Option<String>, args: Vec<String>)
             }
         }
     } else {
+        let mut full_args = Vec::new();
+        if let Some(c) = command {
+            full_args.push(c);
+        }
+        full_args.extend(args);
+
         let req_id = format!(
             "exec-{}",
             std::time::SystemTime::now()
@@ -544,7 +608,7 @@ async fn handle_exec(target: String, command: Option<String>, args: Vec<String>)
         let req = HostMessage::Exec {
             id: req_id,
             command: target,
-            args,
+            args: full_args,
             env: HashMap::new(),
             timeout_secs: 30,
         };
@@ -577,15 +641,84 @@ async fn handle_exec(target: String, command: Option<String>, args: Vec<String>)
     }
 }
 
+async fn handle_pull(image: String) -> Result<i32> {
+    let images_dir = dirs_home().join(".maclet/images");
+    let mgr = maclet_image::ImageManager::new(images_dir)?;
+    match mgr.pull(&image).await {
+        Ok(img) => {
+            println!("Successfully pulled image {} (digest: {})", img.name.bold(), img.id);
+            Ok(0)
+        }
+        Err(e) => {
+            eprintln!("{}: {}", "Pull error".bold().red(), e);
+            Ok(1)
+        }
+    }
+}
+
+async fn handle_images() -> Result<i32> {
+    let images_dir = dirs_home().join(".maclet/images");
+    let mgr = maclet_image::ImageManager::new(images_dir)?;
+    let list = mgr.list_images()?;
+    println!(
+        "{:<20} {:<12} {:<16} {:<14} {:<12}",
+        "REPOSITORY", "TAG", "IMAGE ID", "CREATED", "SIZE"
+    );
+    for img in list {
+        let size_mb = img.size_bytes as f64 / (1024.0 * 1024.0);
+        let rel_time = format_relative_time(img.created_at);
+        println!(
+            "{:<20} {:<12} {:<16} {:<14} {:.1} MB",
+            img.name, img.tag, img.id, rel_time, size_mb
+        );
+    }
+    Ok(0)
+}
+
+async fn handle_system_info() -> Result<i32> {
+    println!("{}", "=== Maclet Container Runtime System Information ===".bold().cyan());
+    println!("{:<24} macOS (Darwin)", "Host OS:");
+    println!("{:<24} {}", "Architecture:", std::env::consts::ARCH);
+    println!("{:<24} Apple Virtualization Framework (VZVirtualMachine)", "Hypervisor:");
+    println!("{:<24} 6.6.134-0-virt (ARM64)", "Linux Guest Kernel:");
+    println!("{:<24} Namespaces, Cgroups v2, OverlayFS, pivot_root", "Container Engine:");
+    println!("{:<24} OverlayFS (copy-on-write)", "Storage Driver:");
+    println!("{:<24} maclet0 (10.88.0.1/16 bridge, veth pairs, NAT)", "Networking:");
+    println!("{:<24} ~/.maclet/images", "Image Storage:");
+
+    let sock_p = socket_path();
+    if sock_p.exists() {
+        if let Ok(stream) = UnixStream::connect(&sock_p).await {
+            let (r, mut w) = stream.into_split();
+            let mut buf_r = tokio::io::BufReader::new(r);
+            let req = HostMessage::ListContainers { all: true };
+            if write_async(&mut w, &req).await.is_ok() {
+                if let Ok(Some(GuestMessage::ContainerList { containers })) = read_async(&mut buf_r).await {
+                    let running = containers.iter().filter(|c| c.status == maclet_common::ContainerStatus::Running).count();
+                    println!("{:<24} {} total ({} running)", "Containers:", containers.len(), running);
+                    println!("{:<24} {}", "Daemon Status:", "Running".green());
+                    return Ok(0);
+                }
+            }
+        }
+    }
+    println!("{:<24} {}", "Daemon Status:", "Stopped".yellow());
+    Ok(0)
+}
+
 async fn handle_run(
     detach: bool,
     name: Option<String>,
-    command: String,
+    image_or_cmd: String,
+    command: Option<String>,
     args: Vec<String>,
     hostname: Option<String>,
     memory: Option<String>,
     cpus: Option<f64>,
     pids_limit: Option<u64>,
+    publish: Vec<String>,
+    read_only: bool,
+    cap_drop: Vec<String>,
     show_stats: bool,
 ) -> Result<i32> {
     let sock_p = socket_path();
@@ -593,6 +726,35 @@ async fn handle_run(
         return Err(anyhow!(
             "Maclet VM is not running. Start it with 'maclet machine start' first."
         ));
+    }
+
+    let (image, cmd, final_args) = if image_or_cmd.starts_with('/') {
+        let mut a = Vec::new();
+        if let Some(c) = command {
+            a.push(c);
+        }
+        a.extend(args);
+        ("alpine:latest".to_string(), image_or_cmd, a)
+    } else {
+        let img = image_or_cmd;
+        let c = command.unwrap_or_else(|| "/bin/sh".to_string());
+        (img, c, args)
+    };
+
+    // Check if image exists locally; pull if missing
+    let images_dir = dirs_home().join(".maclet/images");
+    if let Ok(img_mgr) = maclet_image::ImageManager::new(images_dir) {
+        if let Ok(images) = img_mgr.list_images() {
+            let known = images.iter().any(|i| {
+                i.name == image || format!("{}:{}", i.name, i.tag) == image || i.id == image
+            });
+            if !known && image != "alpine" && image != "alpine:latest" {
+                println!("Image '{}' not found locally. Pulling from registry...", image);
+                if let Err(e) = img_mgr.pull(&image).await {
+                    eprintln!("Warning: Image pull failed: {}. Continuing with base rootfs.", e);
+                }
+            }
+        }
     }
 
     let mut limits = maclet_common::ResourceLimits::new();
@@ -624,13 +786,16 @@ async fn handle_run(
     let req = HostMessage::RunContainer {
         id: cnt_id.clone(),
         name,
-        image: "alpine:latest".to_string(),
-        command,
-        args,
+        image,
+        command: cmd,
+        args: final_args,
         env: HashMap::new(),
         hostname,
         limits: Some(limits),
         detached: detach,
+        ports: publish,
+        read_only,
+        drop_caps: cap_drop,
         timeout_secs: 60,
     };
 
@@ -715,13 +880,13 @@ async fn handle_ps(all: bool) -> Result<i32> {
     match resp {
         Some(GuestMessage::ContainerList { containers }) => {
             println!(
-                "{:<16} {:<16} {:<24} {:<18} {:<16} {:<16}",
-                "CONTAINER ID", "IMAGE", "COMMAND", "CREATED", "STATUS", "NAMES"
+                "{:<14} {:<16} {:<20} {:<14} {:<14} {:<16} {:<14}",
+                "CONTAINER ID", "IMAGE", "COMMAND", "CREATED", "STATUS", "PORTS", "NAMES"
             );
             for c in containers {
                 let id_short = if c.id.len() > 12 { &c.id[..12] } else { &c.id };
-                let cmd_short = if c.command.len() > 22 {
-                    format!("\"{}...\"", &c.command[..19])
+                let cmd_short = if c.command.len() > 18 {
+                    format!("\"{}...\"", &c.command[..15])
                 } else {
                     format!("\"{}\"", c.command)
                 };
@@ -739,9 +904,16 @@ async fn handle_ps(all: bool) -> Result<i32> {
                     maclet_common::ContainerStatus::Created => "Created".normal().to_string(),
                 };
                 let rel_time = format_relative_time(c.created_at);
+                let ports_str = if !c.ports.is_empty() {
+                    c.ports.join(", ")
+                } else if let Some(ref ip) = c.ip {
+                    ip.clone()
+                } else {
+                    "-".to_string()
+                };
                 println!(
-                    "{:<16} {:<16} {:<24} {:<18} {:<16} {:<16}",
-                    id_short, c.image, cmd_short, rel_time, status_str, c.name
+                    "{:<14} {:<16} {:<20} {:<14} {:<14} {:<16} {:<14}",
+                    id_short, c.image, cmd_short, rel_time, status_str, ports_str, c.name
                 );
             }
             Ok(0)
@@ -1002,19 +1174,26 @@ async fn main() -> ExitCode {
             command,
             args,
         } => handle_exec(target, command, args).await,
+        Commands::Pull { image } => handle_pull(image).await,
+        Commands::Images => handle_images().await,
         Commands::Run {
             detach,
             name,
+            image,
             command,
             args,
             hostname,
             memory,
             cpus,
             pids_limit,
+            publish,
+            read_only,
+            cap_drop,
             stats,
         } => {
             handle_run(
-                detach, name, command, args, hostname, memory, cpus, pids_limit, stats,
+                detach, name, image, command, args, hostname, memory, cpus, pids_limit, publish,
+                read_only, cap_drop, stats,
             )
             .await
         }
@@ -1024,6 +1203,9 @@ async fn main() -> ExitCode {
         Commands::Logs { id, tail } => handle_logs(id, tail).await,
         Commands::Inspect { id } => handle_inspect(id).await,
         Commands::Stats { id } => handle_stats(id).await,
+        Commands::System { command } => match command {
+            SystemCommands::Info => handle_system_info().await,
+        },
         Commands::Version => {
             handle_version();
             Ok(0)

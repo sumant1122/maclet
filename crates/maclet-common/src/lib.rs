@@ -10,6 +10,14 @@ pub struct VmConfig {
     pub kernel_path: PathBuf,
     pub initramfs_path: PathBuf,
     pub cmdline: String,
+    #[serde(default)]
+    pub disk_path: Option<PathBuf>,
+    #[serde(default = "default_true")]
+    pub enable_nat: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 impl Default for VmConfig {
@@ -20,6 +28,8 @@ impl Default for VmConfig {
             kernel_path: PathBuf::from("Image"),
             initramfs_path: PathBuf::from("initrd.img"),
             cmdline: "console=hvc0 rdinit=/init quiet".to_string(),
+            disk_path: None,
+            enable_nat: true,
         }
     }
 }
@@ -133,6 +143,10 @@ pub struct ContainerInfo {
     pub exit_code: Option<i32>,
     pub memory_current: Option<u64>,
     pub memory_max: Option<u64>,
+    #[serde(default)]
+    pub ip: Option<String>,
+    #[serde(default)]
+    pub ports: Vec<String>,
 }
 
 /// Detailed container metadata for inspection
@@ -155,6 +169,14 @@ pub struct ContainerInspectDetails {
     pub metrics: Option<CgroupMetrics>,
     pub rootfs_path: String,
     pub log_path: String,
+    #[serde(default)]
+    pub ip: Option<String>,
+    #[serde(default)]
+    pub ports: Vec<String>,
+    #[serde(default)]
+    pub read_only: bool,
+    #[serde(default)]
+    pub drop_caps: Vec<String>,
 }
 
 /// Commands and requests sent from macOS Host to Linux Guest Agent
@@ -194,6 +216,12 @@ pub enum HostMessage {
         limits: Option<ResourceLimits>,
         #[serde(default)]
         detached: bool,
+        #[serde(default)]
+        ports: Vec<String>,
+        #[serde(default)]
+        read_only: bool,
+        #[serde(default)]
+        drop_caps: Vec<String>,
         #[serde(default = "default_timeout")]
         timeout_secs: u64,
     },
@@ -424,11 +452,15 @@ mod tests {
             hostname: Some("mybox".to_string()),
             limits: Some(ResourceLimits::new().with_pids(50)),
             detached: true,
+            ports: vec!["8080:80".to_string()],
+            read_only: false,
+            drop_caps: vec!["CAP_SYS_ADMIN".to_string()],
             timeout_secs: 30,
         };
         let s = serde_json::to_string(&host_msg).unwrap();
         assert!(s.contains("\"type\":\"run_container\""));
         assert!(s.contains("\"detached\":true"));
+        assert!(s.contains("\"ports\":[\"8080:80\"]"));
         let d: HostMessage = serde_json::from_str(&s).unwrap();
         assert_eq!(host_msg, d);
 
@@ -464,6 +496,8 @@ mod tests {
                 exit_code: None,
                 memory_current: Some(1024 * 1024),
                 memory_max: Some(64 * 1024 * 1024),
+                ip: Some("10.88.0.2".to_string()),
+                ports: vec!["8080:80".to_string()],
             }],
         };
         let s3 = serde_json::to_string(&list_msg).unwrap();

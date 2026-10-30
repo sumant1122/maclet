@@ -7,5 +7,6 @@ license.workspace = true
 
 [dependencies]
 maclet-common = { path = "../maclet-common" }
+maclet-network = { path = "../maclet-network" }
 libc = "0.2"
 thiserror = "1.0"

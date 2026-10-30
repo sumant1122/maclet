@@ -8,6 +8,9 @@ members = [
     "crates/maclet-namespaces",
     "crates/maclet-container",
     "crates/maclet-cgroups",
+    "crates/maclet-storage",
+    "crates/maclet-image",
+    "crates/maclet-network",
 ]
 resolver = "2"
 
