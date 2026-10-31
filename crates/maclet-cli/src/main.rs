@@ -580,6 +580,171 @@ fn format_relative_time(created_at: u64) -> String {
     }
 }
 
+async fn execute_single_command(
+    w: &mut tokio::net::unix::OwnedWriteHalf,
+    buf_r: &mut tokio::io::BufReader<tokio::net::unix::OwnedReadHalf>,
+    target: &str,
+    is_container: bool,
+    command: &str,
+    args: Vec<String>,
+) -> Result<(i32, String, String)> {
+    if is_container {
+        let req = HostMessage::ExecInContainer {
+            id: target.to_string(),
+            command: command.to_string(),
+            args,
+            env: HashMap::new(),
+        };
+        write_async(w, &req).await?;
+        let resp: Option<GuestMessage> = read_with_timeout(buf_r, 60).await?;
+        match resp {
+            Some(GuestMessage::ContainerExecResult {
+                exit_code,
+                stdout,
+                stderr,
+                ..
+            }) => Ok((exit_code, stdout, stderr)),
+            Some(GuestMessage::Error { message, .. }) => Ok((1, String::new(), message)),
+            _ => Ok((1, String::new(), "No response from guest agent".to_string())),
+        }
+    } else {
+        let req_id = format!(
+            "exec-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)?
+                .as_millis()
+        );
+        let req = HostMessage::Exec {
+            id: req_id,
+            command: command.to_string(),
+            args,
+            env: HashMap::new(),
+            timeout_secs: 60,
+        };
+        write_async(w, &req).await?;
+        let resp: Option<GuestMessage> = read_with_timeout(buf_r, 60).await?;
+        match resp {
+            Some(GuestMessage::ExecResult {
+                exit_code,
+                stdout,
+                stderr,
+                ..
+            }) => Ok((exit_code, stdout, stderr)),
+            Some(GuestMessage::Error { message, .. }) => Ok((1, String::new(), message)),
+            _ => Ok((1, String::new(), "No response from guest agent".to_string())),
+        }
+    }
+}
+
+async fn run_interactive_shell(
+    w: &mut tokio::net::unix::OwnedWriteHalf,
+    buf_r: &mut tokio::io::BufReader<tokio::net::unix::OwnedReadHalf>,
+    target: String,
+    is_container: bool,
+) -> Result<i32> {
+    let display_name = if is_container {
+        target.clone()
+    } else {
+        "maclet-vm".to_string()
+    };
+
+    println!(
+        "{}",
+        format!(
+            "Connected to {} (/bin/sh). Type 'exit' to quit.",
+            display_name
+        )
+        .bold()
+        .green()
+    );
+
+    let mut cwd = "/".to_string();
+    let mut rl = rustyline::DefaultEditor::new()?;
+
+    loop {
+        let prompt = format!("{}:{} # ", display_name.bold().green(), cwd.bold().blue());
+        let readline = rl.readline(&prompt);
+        match readline {
+            Ok(line) => {
+                let trimmed = line.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                let _ = rl.add_history_entry(line.as_str());
+
+                if trimmed == "exit" || trimmed == "quit" {
+                    break;
+                }
+
+                // Handle directory change
+                if trimmed.starts_with("cd ") || trimmed == "cd" {
+                    let target_dir = if trimmed == "cd" {
+                        "/root"
+                    } else {
+                        trimmed[3..].trim()
+                    };
+
+                    let eval_cmd = format!("cd {} && cd {} && pwd", cwd, target_dir);
+                    let (code, stdout, stderr) = execute_single_command(
+                        w,
+                        buf_r,
+                        &target,
+                        is_container,
+                        "/bin/sh",
+                        vec!["-c".to_string(), eval_cmd],
+                    )
+                    .await?;
+
+                    if code == 0 && !stdout.trim().is_empty() {
+                        cwd = stdout.trim().to_string();
+                    } else {
+                        if !stderr.is_empty() {
+                            eprint!("{}", stderr);
+                        } else {
+                            eprintln!("cd: {}: No such file or directory", target_dir);
+                        }
+                    }
+                    continue;
+                }
+
+                // Execute command inside container
+                let wrapped_cmd = format!("cd {} && {}", cwd, trimmed);
+                let (_code, stdout, stderr) = execute_single_command(
+                    w,
+                    buf_r,
+                    &target,
+                    is_container,
+                    "/bin/sh",
+                    vec!["-c".to_string(), wrapped_cmd],
+                )
+                .await?;
+
+                if !stdout.is_empty() {
+                    print!("{}", stdout);
+                }
+                if !stderr.is_empty() {
+                    eprint!("{}", stderr);
+                }
+            }
+            Err(rustyline::error::ReadlineError::Interrupted) => {
+                // Ctrl-C
+                println!("^C");
+            }
+            Err(rustyline::error::ReadlineError::Eof) => {
+                // Ctrl-D
+                break;
+            }
+            Err(err) => {
+                eprintln!("Error reading input: {:?}", err);
+                break;
+            }
+        }
+    }
+
+    println!("Connection to {} closed.", display_name);
+    Ok(0)
+}
+
 async fn handle_exec(target: String, command: Option<String>, args: Vec<String>) -> Result<i32> {
     let sock_p = socket_path();
     if !sock_p.exists() {
@@ -608,6 +773,16 @@ async fn handle_exec(target: String, command: Option<String>, args: Vec<String>)
             false
         }
     };
+
+    let is_interactive = command.is_none()
+        || (matches!(
+            command.as_deref(),
+            Some("/bin/sh") | Some("/bin/bash") | Some("sh") | Some("bash")
+        ) && args.is_empty());
+
+    if is_interactive {
+        return run_interactive_shell(&mut w, &mut buf_r, target, is_container).await;
+    }
 
     if is_container {
         let exec_cmd = command.unwrap_or_else(|| "/bin/sh".to_string());
