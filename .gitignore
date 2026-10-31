@@ -1,9 +1,23 @@
+# Rust build artifacts
 /target
+Cargo.lock.d/
+**/*.rs.bk
+
+# macOS
 .DS_Store
+**/.DS_Store
+._*
+
+# Editors & IDEs
+.idea/
+.vscode/
 *.swp
 *~
+
+# Maclet runtime artifacts & logs
+.maclet/
+daemon.log
+*.sock
 /tmp
 *.a
 *.o
-.maclet
-daemon.log
