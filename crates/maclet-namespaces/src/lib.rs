@@ -352,6 +352,11 @@ fn exec_linux_namespaces(
         if exec_child_pid == 0 {
             // Inside the container!
             unsafe {
+                let devnull = libc::open(b"/dev/null\0".as_ptr() as *const _, libc::O_RDONLY);
+                if devnull >= 0 {
+                    libc::dup2(devnull, libc::STDIN_FILENO);
+                    libc::close(devnull);
+                }
                 libc::dup2(stdout_pipe[1], libc::STDOUT_FILENO);
                 libc::dup2(stderr_pipe[1], libc::STDERR_FILENO);
                 libc::close(stdout_pipe[1]);

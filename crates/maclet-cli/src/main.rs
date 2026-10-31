@@ -317,6 +317,9 @@ async fn handle_start(daemon: bool) -> Result<()> {
             .spawn()
             .context("Failed to spawn daemon process")?;
 
+        let pid_path = maclet_home().join("maclet.pid");
+        let _ = fs::write(&pid_path, child.id().to_string());
+
         println!(
             "{}",
             format!("Maclet VM daemon started in background (PID {})", child.id())
@@ -422,6 +425,14 @@ async fn handle_start(daemon: bool) -> Result<()> {
                             break;
                         }
 
+                        if is_shutdown {
+                            let _ = write_async(&mut client_w, &GuestMessage::Pong { id: "stop".to_string() }).await;
+                            tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+                            let _ = fs::remove_file(socket_path());
+                            let _ = fs::remove_file(maclet_home().join("maclet.pid"));
+                            std::process::exit(0);
+                        }
+
                         match read_async::<_, GuestMessage>(&mut *gr).await {
                             Ok(Some(guest_res)) => {
                                 let _ = write_async(&mut client_w, &guest_res).await;
@@ -431,10 +442,6 @@ async fn handle_start(daemon: bool) -> Result<()> {
                                 eprintln!("Error reading response from guest: {}", e);
                                 break;
                             }
-                        }
-
-                        if is_shutdown {
-                            std::process::exit(0);
                         }
                     }
                 });
@@ -449,6 +456,17 @@ async fn handle_start(daemon: bool) -> Result<()> {
     }
 
     Ok(())
+}
+
+async fn read_with_timeout<R, T>(r: &mut R, secs: u64) -> Result<Option<T>>
+where
+    R: tokio::io::AsyncBufRead + Unpin,
+    T: serde::de::DeserializeOwned,
+{
+    match tokio::time::timeout(tokio::time::Duration::from_secs(secs), read_async(r)).await {
+        Ok(res) => res.map_err(|e| anyhow!("IPC error: {}", e)),
+        Err(_) => Err(anyhow!("Timed out waiting for response from Maclet VM")),
+    }
 }
 
 async fn handle_status() -> Result<()> {
@@ -471,7 +489,13 @@ async fn handle_status() -> Result<()> {
     let mut buf_r = tokio::io::BufReader::new(r);
 
     write_async(&mut w, &HostMessage::Ping { id: "status-check".to_string() }).await?;
-    let resp: Option<GuestMessage> = read_async(&mut buf_r).await?;
+    let resp: Option<GuestMessage> = match read_with_timeout(&mut buf_r, 5).await {
+        Ok(r) => r,
+        Err(e) => {
+            println!("{}: {}", "Status: UNRESPONSIVE".bold().red(), e);
+            return Ok(());
+        }
+    };
 
     if let Some(GuestMessage::Pong { id }) = resp {
         if id == "status-check" {
@@ -486,28 +510,55 @@ async fn handle_status() -> Result<()> {
 
 async fn handle_machine_stop() -> Result<()> {
     let sock_p = socket_path();
-    if !sock_p.exists() {
+    let pid_p = maclet_home().join("maclet.pid");
+
+    let pid = if pid_p.exists() {
+        fs::read_to_string(&pid_p)
+            .ok()
+            .and_then(|s| s.trim().parse::<i32>().ok())
+    } else {
+        None
+    };
+
+    if !sock_p.exists() && pid.is_none() {
         println!("{}", "Maclet VM is already stopped.".yellow());
         return Ok(());
     }
 
-    let stream = match UnixStream::connect(&sock_p).await {
-        Ok(s) => s,
-        Err(_) => {
-            println!("{}", "Maclet VM is not running (cleaning up socket).".yellow());
-            let _ = fs::remove_file(&sock_p);
-            return Ok(());
+    if sock_p.exists() {
+        if let Ok(stream) = UnixStream::connect(&sock_p).await {
+            let (r, mut w) = stream.into_split();
+            let mut buf_r = tokio::io::BufReader::new(r);
+
+            println!("Sending shutdown command to guest VM...");
+            let _ = write_async(&mut w, &HostMessage::Shutdown { id: "cli-stop".to_string() }).await;
+            let _ = tokio::time::timeout(
+                tokio::time::Duration::from_secs(3),
+                read_async::<_, GuestMessage>(&mut buf_r),
+            )
+            .await;
         }
-    };
+        let _ = fs::remove_file(&sock_p);
+    }
 
-    let (r, mut w) = stream.into_split();
-    let mut buf_r = tokio::io::BufReader::new(r);
+    if let Some(p) = pid {
+        unsafe {
+            if libc::kill(p, 0) == 0 {
+                libc::kill(p, libc::SIGTERM);
+                for _ in 0..20 {
+                    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+                    if libc::kill(p, 0) != 0 {
+                        break;
+                    }
+                }
+                if libc::kill(p, 0) == 0 {
+                    libc::kill(p, libc::SIGKILL);
+                }
+            }
+        }
+        let _ = fs::remove_file(&pid_p);
+    }
 
-    println!("Sending shutdown command to guest VM...");
-    write_async(&mut w, &HostMessage::Shutdown { id: "cli-stop".to_string() }).await?;
-    let _ = read_async::<_, GuestMessage>(&mut buf_r).await;
-
-    let _ = fs::remove_file(&sock_p);
     println!("{}", "Maclet Linux VM stopped successfully.".green());
     Ok(())
 }
@@ -550,7 +601,7 @@ async fn handle_exec(target: String, command: Option<String>, args: Vec<String>)
     } else {
         let req = HostMessage::ListContainers { all: true };
         write_async(&mut w, &req).await?;
-        let resp: Option<GuestMessage> = read_async(&mut buf_r).await?;
+        let resp: Option<GuestMessage> = read_with_timeout(&mut buf_r, 10).await?;
         if let Some(GuestMessage::ContainerList { containers }) = resp {
             containers.iter().any(|c| c.id == target || c.name == target || c.id.starts_with(&target))
         } else {
@@ -567,7 +618,7 @@ async fn handle_exec(target: String, command: Option<String>, args: Vec<String>)
             env: HashMap::new(),
         };
         write_async(&mut w, &req).await?;
-        let resp: Option<GuestMessage> = read_async(&mut buf_r).await?;
+        let resp: Option<GuestMessage> = read_with_timeout(&mut buf_r, 30).await?;
         match resp {
             Some(GuestMessage::ContainerExecResult {
                 exit_code,
@@ -613,7 +664,7 @@ async fn handle_exec(target: String, command: Option<String>, args: Vec<String>)
             timeout_secs: 30,
         };
         write_async(&mut w, &req).await?;
-        let resp: Option<GuestMessage> = read_async(&mut buf_r).await?;
+        let resp: Option<GuestMessage> = read_with_timeout(&mut buf_r, 30).await?;
         match resp {
             Some(GuestMessage::ExecResult {
                 exit_code,
@@ -800,7 +851,7 @@ async fn handle_run(
     };
 
     write_async(&mut w, &req).await?;
-    let resp: Option<GuestMessage> = read_async(&mut buf_r).await?;
+    let resp: Option<GuestMessage> = read_with_timeout(&mut buf_r, 60).await?;
 
     match resp {
         Some(GuestMessage::ContainerStarted { id, .. }) => {
@@ -876,7 +927,7 @@ async fn handle_ps(all: bool) -> Result<i32> {
     let req = HostMessage::ListContainers { all };
     write_async(&mut w, &req).await?;
 
-    let resp: Option<GuestMessage> = read_async(&mut buf_r).await?;
+    let resp: Option<GuestMessage> = read_with_timeout(&mut buf_r, 10).await?;
     match resp {
         Some(GuestMessage::ContainerList { containers }) => {
             println!(
@@ -945,7 +996,7 @@ async fn handle_stop_container(id: String, time: u64) -> Result<i32> {
     };
     write_async(&mut w, &req).await?;
 
-    let resp: Option<GuestMessage> = read_async(&mut buf_r).await?;
+    let resp: Option<GuestMessage> = read_with_timeout(&mut buf_r, time + 5).await?;
     match resp {
         Some(GuestMessage::ContainerStopped { id, .. }) => {
             println!("{}", id);
@@ -978,7 +1029,7 @@ async fn handle_rm(id: String, force: bool) -> Result<i32> {
     };
     write_async(&mut w, &req).await?;
 
-    let resp: Option<GuestMessage> = read_async(&mut buf_r).await?;
+    let resp: Option<GuestMessage> = read_with_timeout(&mut buf_r, 10).await?;
     match resp {
         Some(GuestMessage::ContainerRemoved { id }) => {
             println!("{}", id);
@@ -1011,7 +1062,7 @@ async fn handle_logs(id: String, tail: Option<usize>) -> Result<i32> {
     };
     write_async(&mut w, &req).await?;
 
-    let resp: Option<GuestMessage> = read_async(&mut buf_r).await?;
+    let resp: Option<GuestMessage> = read_with_timeout(&mut buf_r, 10).await?;
     match resp {
         Some(GuestMessage::ContainerLogsResult { logs, .. }) => {
             print!("{}", logs);
@@ -1041,7 +1092,7 @@ async fn handle_inspect(id: String) -> Result<i32> {
     let req = HostMessage::InspectContainer { id: id.clone() };
     write_async(&mut w, &req).await?;
 
-    let resp: Option<GuestMessage> = read_async(&mut buf_r).await?;
+    let resp: Option<GuestMessage> = read_with_timeout(&mut buf_r, 10).await?;
     match resp {
         Some(GuestMessage::InspectResult { details, .. }) => {
             println!("{}", serde_json::to_string_pretty(&details)?);
@@ -1073,7 +1124,7 @@ async fn handle_stats(id: Option<String>) -> Result<i32> {
             id: target_id.clone(),
         };
         write_async(&mut w, &req).await?;
-        let resp: Option<GuestMessage> = read_async(&mut buf_r).await?;
+        let resp: Option<GuestMessage> = read_with_timeout(&mut buf_r, 10).await?;
         match resp {
             Some(GuestMessage::InspectResult { details, .. }) => {
                 println!(
@@ -1113,7 +1164,7 @@ async fn handle_stats(id: Option<String>) -> Result<i32> {
     } else {
         let req = HostMessage::ListContainers { all: false };
         write_async(&mut w, &req).await?;
-        let resp: Option<GuestMessage> = read_async(&mut buf_r).await?;
+        let resp: Option<GuestMessage> = read_with_timeout(&mut buf_r, 10).await?;
         match resp {
             Some(GuestMessage::ContainerList { containers }) => {
                 println!(
